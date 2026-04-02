@@ -245,10 +245,8 @@ def get_latest_prices():
         resp = requests.get("https://prices.runescape.wiki/api/v1/osrs/latest", timeout=10)
         if resp.status_code == 200:
             return resp.json()['data']
-            
-
-        else:
-            print("[ERROR] Could not fetch latest prices from RS Wiki API: HTTP", resp.status_code)
+        print("[ERROR] Could not fetch latest prices from RS Wiki API: HTTP", resp.status_code)
+        return {}
     except Exception as e:
         print("[ERROR] Could not fetch latest prices from RS Wiki API:", e)
         return {}
@@ -317,6 +315,12 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
 
 
     forecast_hours = int(filters.get('FORECAST_HOURS', 168))
+    try:
+        forecast_recency_minutes = int(filters.get('FORECAST_RECENCY_MINUTES', 0) or 0)
+    except (TypeError, ValueError):
+        forecast_recency_minutes = 0
+    if forecast_recency_minutes < 0:
+        forecast_recency_minutes = 0
     try:
         max_qty_factor = float(max_qty_factor) if max_qty_factor is not None else 1.0
     except (TypeError, ValueError):
@@ -406,6 +410,13 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
                 item_history.pop(item_id, None)
                 continue
 
+            # Exclude most recent points from forecast training data when requested.
+            interval_minutes = 5 if forecast_sell_time_val <= 180 else 60
+            skip_points = int(math.ceil(forecast_recency_minutes / interval_minutes)) if forecast_recency_minutes > 0 else 0
+            hist_for_forecast = hist[:-skip_points] if skip_points > 0 else hist
+            if not hist_for_forecast:
+                continue
+
             
             hist_5m = item_history_5m.get(item_id, [])
             latest = latest_prices.get(item_id, {})
@@ -477,9 +488,9 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
                 if N > 1:
                     coeffs = np.polyfit(xs, ys, 1)
                     slope = coeffs[0]
-                    # Threshold for trend: 0.5% of mean per step
+                    # Threshold for trend: 1% of mean per step
                     mean_y = np.mean(ys)
-                    threshold = abs(mean_y) * 0.005
+                    threshold = abs(mean_y) * 0.01
                     if forecast_sell_time < 180:
                         threshold = threshold / 12
                     if slope > threshold:
@@ -519,7 +530,7 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
             t4 = time.time()
             t3d += t4 - t3
 
-            forecast_hist = hist.copy()
+            forecast_hist = [entry.copy() for entry in hist_for_forecast]
             limit = 1.2 * avg_std_med
 
             for e in forecast_hist:
@@ -984,7 +995,7 @@ if __name__ == "__main__":
     name_filter = []
     if len(sys.argv) > 1:
         name_filter = [sys.argv[1]]
-    results, forecasts = analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy, name_filter=name_filter)
+    results, forecasts, _latest_prices = analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy, name_filter=name_filter)
     print("Results:")
     print("\nForecast len: ", len(forecasts))
     

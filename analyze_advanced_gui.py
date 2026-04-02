@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import math
+import importlib
 from datetime import datetime, timedelta, timezone
 import time
 import pandas as pandas_mod
@@ -36,6 +37,32 @@ from backend import (
     get_latest_prices
 )
 from forecast_helpers import forecast_avg_price
+
+
+def fetch_and_save_5m_data_safe(log_context=''):
+    """Best-effort 5m refresh. Skip silently when optional module is unavailable."""
+    context_suffix = f" ({log_context})" if log_context else ''
+    try:
+        fetch_module = importlib.import_module('fetch_5m_data')
+        fetch_and_save_5m_data = getattr(fetch_module, 'fetch_and_save_5m_data', None)
+        if fetch_and_save_5m_data is None:
+            print(f"[DEBUG] fetch_5m_data module missing fetch_and_save_5m_data; skipping 5m refresh{context_suffix}.")
+            return False
+    except ModuleNotFoundError:
+        print(f"[DEBUG] fetch_5m_data module not found; skipping 5m refresh{context_suffix}.")
+        return False
+    except Exception as e:
+        print(f"[DEBUG] Could not import fetch_5m_data{context_suffix}: {e}")
+        return False
+
+    try:
+        fetch_and_save_5m_data()
+        return True
+    except Exception as e:
+        print(f"Error fetching 5m data{context_suffix}: {e}")
+        return False
+
+
 def evaluate_forecast_for_item(hist, forecast_horizon=60, train_ratio=0.8):
     """
     Split hist into train/test, forecast test points, and print error metrics.
@@ -92,7 +119,8 @@ filter_defaults = {
     'MIN_POTENTIAL_PROFIT': 10000,
     'MIN_VOLUME_POTENTIAL': 6,
     'MIN_FORECAST_ROI': 5,
-    'FORECAST_HOURS': 168
+    'FORECAST_HOURS': 168,
+    'FORECAST_RECENCY_MINUTES': 0
 }
 
 one_h_dt, five_m_dt = get_update_times()
@@ -131,7 +159,7 @@ app.layout = html.Div([
     html.Div(id='tab-content'),
     dcc.Store(id='forecasted-prices-store'),
     dcc.Store(id='dark-mode-store', data={'dark_mode': False}),
-], id='app-container', style={'fontFamily': 'Arial, sans-serif', 'minHeight': '100vh'})
+], id='app-container', style={'minHeight': '100vh'})
 
 @app.callback(
     [Output('dark-mode-store', 'data'), Output('dark-mode-toggle', 'style')],
@@ -189,55 +217,67 @@ def render_tab_content(tab):
         return html.Div([
             html.H2('OSRS GE Forecast Analysis (Dash)'),
             html.Div([
-                html.Label('Search Item Name', style={'marginRight': '10px'}),
-                dcc.Input(id='item-name-search', type='text', placeholder='Enter item name', debounce=True, style={'width': '220px', 'marginRight': '30px'}),
-                dcc.Checklist(
-                    id='filter-by-watchlist',
-                    options=[{'label': 'Show only watchlist items', 'value': 'watchlist'}],
-                    value=[],
-                    style={'marginRight': '30px'}
-                ),
-                html.Label('Risk Filter:', style={'marginRight': '10px'}),
-                dcc.Dropdown(
-                    id='risk-filter',
-                    options=[
-                        {'label': 'All Items', 'value': 'all'},
-                        {'label': 'Low Risk Only', 'value': 'low'},
-                        {'label': 'Low + Medium Risk', 'value': 'low_medium'},
-                        {'label': 'Exclude High Risk', 'value': 'exclude_high'},
-                    ],
-                    value='all',
-                    clearable=False,
-                    style={'width': '180px', 'display': 'inline-block', 'marginRight': '30px'}
-                ),
-                html.Label('Status Filter:', style={'marginRight': '10px'}),
-                dcc.Dropdown(
-                    id='status-filter',
-                    options=['Normal', 'Volume imbalance', 'Possible manipulation', 'Abnormally high', 'Abnormally low', 'Spread unusually high'
-                             ,'Low price dump', 'High price spike', 'Low-Volume spike', 'High-Volume spike'
-                             ,'Low-Volume low', 'Low-Volume high', 'High-Volume low', 'High-Volume high'],  # Will be set dynamically
+                html.H4('1) Market Scope', className='filter-section-title'),
+                html.Div([
+                    html.Div([
+                        html.Label('Item Search', style={'marginRight': '10px'}),
+                        dcc.Input(id='item-name-search', type='text', placeholder='Type item name...', debounce=True, style={'width': '220px', 'marginRight': '30px'}),
+                    ], className='filter-field'),
+                    html.Div([
+                        dcc.Checklist(
+                            id='filter-by-watchlist',
+                            options=[{'label': 'Watchlist Only', 'value': 'watchlist'}],
+                            value=[],
+                            style={'marginRight': '30px'}
+                        ),
+                    ], className='filter-field'),
+                    html.Div([
+                        html.Label('Risk Level', style={'marginLeft': '40px', 'marginRight': '10px'}),
+                        dcc.Dropdown(
+                            id='risk-filter',
+                            options=[
+                                {'label': 'All Items', 'value': 'all'},
+                                {'label': 'Low Risk Only', 'value': 'low'},
+                                {'label': 'Low + Medium Risk', 'value': 'low_medium'},
+                                {'label': 'Exclude High Risk', 'value': 'exclude_high'},
+                            ],
+                            value='all',
+                            clearable=False,
+                            searchable=False,
+                            style={'width': '180px', 'display': 'inline-block', 'marginRight': '30px'}
+                        ),
+                    ], className='filter-field'),
+                    html.Div([
+                        html.Label('Status / Warnings', style={'marginRight': '10px'}),
+                        dcc.Dropdown(
+                            id='status-filter',
+                            options=['Normal', 'Volume imbalance', 'Possible manipulation', 'Abnormally high', 'Abnormally low', 'Spread unusually high'
+                                     ,'Low price dump', 'High price spike', 'Low-Volume spike', 'High-Volume spike'
+                                     ,'Low-Volume low', 'Low-Volume high', 'High-Volume low', 'High-Volume high'],  # Will be set dynamically
 
-                    value=[],
-                    multi=True,
-                    clearable=True,
-                    style={'width': 'auto', 'minWidth': '250px', 'display': 'inline-block', 'marginRight': '30px'},
-                    maxHeight=300,
-                    optionHeight=36,
-                    placeholder='Select status/warning...'
-                ),
-                dcc.Checklist(
-                    id='status-filter-exclude',
-                    options=[{'label': 'Exclude selected', 'value': 'exclude'}],
-                    value=[],
-                    style={'display': 'inline-block'}
-                ),
-
-            
-            ], style={'marginBottom': '12px', 'display': 'flex', 'alignItems': 'center'}),
+                            value=[],
+                            multi=True,
+                            clearable=True,
+                            searchable=False,
+                            style={'width': 'auto', 'minWidth': '250px', 'display': 'inline-block', 'marginRight': '30px'},
+                            maxHeight=300,
+                            optionHeight=36,
+                            placeholder='Choose warnings...'
+                        ),
+                        dcc.Checklist(
+                            id='status-filter-exclude',
+                            options=[{'label': 'Exclude Chosen Statuses', 'value': 'exclude'}],
+                            value=[],
+                            style={'display': 'inline-block'}
+                        ),
+                    ], className='filter-field'),
+                ], className='filter-row')
+            ], className='filter-section-card'),
             html.Div(id='update-times', style={'marginBottom': '12px', 'fontSize': '16px'}),
             dcc.Interval(id='refresh-interval', interval=24*60*60*1000, n_intervals=0, disabled=True),
             html.Div([
                 html.Div([
+                    html.H4('2) Forecast Inputs', className='filter-section-title'),
                     html.Div([
                         html.Label('Forecast Strategy', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Dropdown(
@@ -267,22 +307,23 @@ def render_tab_content(tab):
                             ],
                             value='wma',
                             clearable=False,
-                            style={'width': 'auto', 'minWidth': '250px'}
-                        ),], style={'display': 'flex', 'width': 'auto', 'marginBottom': '16px'}),
+                            searchable=False,
+                            style={'display': 'inline-block'}
+                        ),], className='filter-row', style={'display': 'flex', 'width': 'auto', 'marginBottom': '16px'}),
                     html.Div([
-                        html.Label('Forecast Sell Time', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Target Hold Time (min)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='forecast-sell-time', type='number', value=60, min=5, step=5, debounce=True, style={'width': '40px', 'marginRight': '30px'}),
                         html.Label('Min Price', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-price', type='number', value=0, debounce=True, style={'width': '70px', 'marginRight': '30px'}),
                         html.Label('Max Price', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='max-price', type='number', value=0, debounce=True, style={'width': '70px', 'marginRight': '30px'}),
-                        html.Label('Min Avg Daily Volume', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Min Daily Volume', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-avg-daily-volume', type='number', value=0, debounce=True, style={'width': '90px', 'marginRight': '30px'}),
-                        html.Label('Max Avg Trade Time (min)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Max Time to Fill (min)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='max-avg-trade-time', type='number', value=0, debounce=True, style={'width': '120px', 'marginRight': '30px'}),
-                    ], style={'display': 'flex', 'width': 'auto', 'marginBottom': '12px'}),
+                    ], className='filter-row', style={'display': 'flex', 'width': 'auto', 'marginBottom': '12px'}),
                     html.Div([
-                        html.Label('Buy Price Type', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Buy Price Source', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Dropdown(
                             id='buy-price-type',
                             options=[
@@ -292,9 +333,10 @@ def render_tab_content(tab):
                             ],
                             value='low',
                             clearable=False,
-                            style={'width': '200px', 'marginRight': '30px'}
+                            searchable=False,
+                            style={'display': 'inline-block', 'marginRight': '30px'}
                         ),
-                        html.Label('Forecast Price Type', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Forecast Target Price', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Dropdown(
                             id='forecast-price-type',
                             options=[
@@ -304,28 +346,33 @@ def render_tab_content(tab):
                             ],
                             value='avg',
                             clearable=False,
-                            style={'width': '140px', 'marginRight': '30px'}
+                            searchable=False,
+                            style={'display': 'inline-block', 'marginRight': '30px'}
                         ),
-                    ], style={'display': 'flex', 'width': 'auto', 'marginBottom': '12px'}),
+                    ], className='filter-row', style={'display': 'flex', 'width': 'auto', 'marginBottom': '12px'}),
+                    html.H4('3) Profit, Liquidity, and Risk Thresholds', className='filter-section-title'),
                     html.Div([
-                        html.Label('Min Forecast Profit', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Min Forecast Profit (gp)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-profit', type='number', value=filter_defaults['MIN_FORECAST_PROFIT'], debounce=True, style={'width': '70px', 'marginRight': '30px'}),
-                        html.Label('Min Potential Profit', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Min Potential Profit (gp)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-potential-profit', type='number', value=filter_defaults['MIN_POTENTIAL_PROFIT'], debounce=True, style={'width': '90px', 'marginRight': '30px'}),
-                        html.Label('Min Volume Potential', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Min Volume Potential (gp)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-volume', type='number', value=filter_defaults['MIN_VOLUME_POTENTIAL'], debounce=True, style={'width': '90px', 'marginRight': '30px'}),
-                        html.Label('Min ROI', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Min ROI (%)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-roi', type='number', value=filter_defaults['MIN_FORECAST_ROI'], debounce=True, style={'width': '60px', 'marginRight': '30px'}),
-                        html.Label('Forecast Hours', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('History Window (hrs)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='forecast-hours', type='number', value=filter_defaults['FORECAST_HOURS'], debounce=True, style={'width': '60px', 'marginRight': '30px'}),
-                        html.Label('Volume Power', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Ignore Recent Data (min)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        dcc.Input(id='forecast-recency-minutes', type='number', value=filter_defaults['FORECAST_RECENCY_MINUTES'], min=0, debounce=True, style={'width': '80px', 'marginRight': '30px'}),
+                        html.Label('Volume Weight', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='volume-power', type='number', value=1, debounce=True, style={'width': '90px', 'marginRight': '30px'}),
-                        html.Label('Max Qty Factor', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Amount Multiplier', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='max-qty-factor', type='number', value=1, min=0, step=0.1, debounce=True, style={'width': '90px', 'marginRight': '30px'}),
-                    ], style={'display': 'flex', 'width': 'auto', 'marginBottom': '16px'}),
+                    ], className='filter-row compact-threshold-row', style={'display': 'flex', 'width': 'auto', 'marginBottom': '16px'}),
                 ], style={'display': 'block', 'flexWrap': 'wrap', 'gap': '6px', 'alignItems': 'center', 'marginBottom': '12px'}),
+                html.H4('4) Ranking and Output', className='filter-section-title'),
                 html.Div([
-                    html.Label('Trend', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                    html.Label('Trend Direction', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                     dcc.Dropdown(
                         id='trend-filter',
                         options=[
@@ -336,11 +383,12 @@ def render_tab_content(tab):
                         ],
                         value='',
                         clearable=False,
+                        searchable=False,
                         style={'width': '80px', 'marginRight': '30px'}
                     ),
-                    html.Label('Top N', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                    html.Label('Result Limit', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                     dcc.Input(id='top-n', type='number', value=10, min=1, debounce=True, style={'width': '60px', 'marginRight': '30px'}),
-                    html.Label('Sort by Attribute', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                    html.Label('Sort By', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                     dcc.Dropdown(
                         id='sort-attribute',
                         options=[
@@ -356,12 +404,14 @@ def render_tab_content(tab):
                         ],
                         value='potential_profit',
                         clearable=False,
-                        style={'width': '120px', 'marginRight': '30px'}
+                        searchable=False,
+                        style={'display': 'inline-block', 'marginRight': '30px'}
                     ),
-                    html.Button('Apply Filters', id='apply-filters', n_clicks=0, style={'height': '40px'}),
-                ], style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '6px', 'alignItems': 'center', 'marginBottom': '12px'}),
+                    html.Button('Apply Filters and Refresh Results', id='apply-filters', n_clicks=0, style={'height': '40px'}),
+                ], className='filter-row compact-ranking-row', style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '6px', 'alignItems': 'center', 'marginBottom': '12px'}),
+                html.H4('5) Saved Presets', className='filter-section-title'),
                 html.Div([
-                    html.Label('Template:', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                    html.Label('Saved Filter:', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                     dcc.Dropdown(
                         id='template-dropdown',
                         options=[{'label': name, 'value': name} for name in list_filter_templates()],
@@ -369,14 +419,14 @@ def render_tab_content(tab):
                         placeholder='Select template',
                         style={'width': '180px', 'marginRight': '10px'}
                     ),
-                    dcc.Input(id='template-name', type='text', placeholder='Template name', style={'width': '120px', 'marginRight': '10px'}),
-                    html.Button('Save', id='save-template', n_clicks=0, style={'marginRight': '6px'}),
-                    html.Button('Load', id='load-template', n_clicks=0, style={'marginRight': '6px'}),
-                    html.Button('Delete', id='delete-template', n_clicks=0, style={'marginRight': '6px'}),
+                    dcc.Input(id='template-name', type='text', placeholder='New preset name', style={'marginRight': '10px'}),
+                    html.Button('Save Preset', id='save-template', n_clicks=0, style={'marginRight': '6px'}),
+                    html.Button('Load Preset', id='load-template', n_clicks=0, style={'marginRight': '6px'}),
+                    html.Button('Delete Preset', id='delete-template', n_clicks=0, style={'marginRight': '6px'}),
                     html.Span(id='template-status', style={'marginLeft': '10px', 'color': '#888'}),
-                ], style={'display': 'flex', 'alignItems': 'center', 'gap': '6px', 'marginBottom': '8px'}),
+                ], className='filter-row', style={'display': 'flex', 'alignItems': 'center', 'gap': '6px', 'marginBottom': '8px'}),
                 # Insert Add selected to watchlist button and store
-                html.Button('Add selected to the watchlist', id='add-selected-to-watchlist-btn', n_clicks=0, style={'marginBottom': '10px', 'marginRight': '10px'}),
+                html.Button('Add Selected Rows to Watchlist', id='add-selected-to-watchlist-btn', n_clicks=0, style={'marginBottom': '10px', 'marginRight': '10px'}),
                 dcc.Store(id='selected-row-store'),
                 html.Div(id='add-selected-status', style={'marginLeft': '12px', 'color': '#1976d2', 'fontWeight': 'bold'}),
                 # Insert forecast table with loading spinner
@@ -391,8 +441,8 @@ def render_tab_content(tab):
                             active_cell=None,
                             page_size=25,
                             style_table={'overflowX': 'auto'},
-                            style_cell={'textAlign': 'center'},
-                            style_header={'fontWeight': 'bold'},
+                            style_cell={'textAlign': 'center', 'fontSize': '11px', 'padding': '0px 6px', 'height': '24px', 'maxHeight': '20px', 'minHeight': '0px', 'lineHeight': '20px'},
+                            style_header={'fontWeight': 'bold', 'fontSize': '11px', 'padding': '0px 6px', 'height': '24px', 'maxHeight': '20px', 'minHeight': '0px', 'lineHeight': '20px'},
                             style_data_conditional=[
                                 # Color codes for key columns (background only)
                                 {'if': {'column_id': 'lowP'}, 'backgroundColor': '#e0f7fa'},
@@ -515,8 +565,8 @@ def render_tab_content(tab):
                 data=watchlist,
                 page_size=25,
                 style_table={'overflowX': 'auto'},
-                style_cell={'textAlign': 'center'},
-                style_header={'fontWeight': 'bold'},
+                style_cell={'textAlign': 'center', 'fontSize': '11px', 'padding': '0px 6px', 'height': '20px', 'maxHeight': '20px', 'minHeight': '0px', 'lineHeight': '20px'},
+                style_header={'fontWeight': 'bold', 'fontSize': '11px', 'padding': '0px 6px', 'height': '20px', 'maxHeight': '20px', 'minHeight': '0px', 'lineHeight': '20px'},
                 style_data_conditional=[
                     {'if': {'row_index': 'odd'}, 'backgroundColor': '#f9f9f9'},
                     {'if': {'row_index': 'even'}, 'backgroundColor': 'white'},
@@ -528,64 +578,7 @@ def render_tab_content(tab):
         ], className='tab-page')
 
 
-    # --- Combined callback for removing selected and persisting entry price edits ---
-    @app.callback(
-        # [Output('remove-selected-status', 'children'), Output('watchlist-table', 'data')],
-        [Input('remove-selected-from-watchlist-btn', 'n_clicks'), Input('watchlist-table', 'data_timestamp')],
-        [State('watchlist-table', 'selected_rows'), State('watchlist-table', 'data')],
-        prevent_initial_call=True
-    )
-    def handle_watchlist_table(remove_n_clicks, data_timestamp, selected_rows, rows):
-        ctx = dash.callback_context
-        if not ctx.triggered:
-            raise PreventUpdate
-        trigger = ctx.triggered[0]['prop_id'].split('.')[0]
-        watchlist_path = os.path.join(APP_DIR, 'Data', 'watchlist.json')
-        status_msg = ''
-        # Remove selected row
-        if trigger == 'remove-selected-from-watchlist-btn':
-            if not rows or not selected_rows:
-                status_msg = 'No row selected.'
-                return status_msg, rows
-            idx = selected_rows[0]
-            if idx < 0 or idx >= len(rows):
-                status_msg = 'Invalid row selected.'
-                return status_msg, rows
-            removed_item = rows.pop(idx)
-            # Save updated watchlist
-            try:
-                with open(watchlist_path, 'w', encoding='utf-8') as f:
-                    json.dump(rows, f, ensure_ascii=False, indent=2)
-                status_msg = f"Removed item: {removed_item.get('item_name', removed_item.get('item_id', ''))}"
-            except Exception as e:
-                status_msg = f"[ERROR] Failed to remove item: {e}"
-            return status_msg, rows
-        # Persist entry price edits
-        elif trigger == 'watchlist-table':
-            if not rows:
-                raise PreventUpdate
-            try:
-                with open(watchlist_path, 'r', encoding='utf-8') as f:
-                    old_watchlist = json.load(f)
-            except Exception:
-                old_watchlist = []
-            old_watchlist_map = {str(item.get('item_id')): item for item in old_watchlist}
-            for row in rows:
-                item_id = str(row.get('item_id'))
-                if item_id in old_watchlist_map:
-                    old_watchlist_map[item_id]['entry_price'] = row.get('entry_price', old_watchlist_map[item_id].get('entry_price'))
-            try:
-                with open(watchlist_path, 'w', encoding='utf-8') as f:
-                    json.dump(list(old_watchlist_map.values()), f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[ERROR] Failed to update entry price in watchlist: {e}")
-            return dash.no_update, rows
-        else:
-            raise PreventUpdate
-    # Add selected to the watchlist button and store
-    html.Button('Add selected to the watchlist', id='add-selected-to-watchlist-btn', n_clicks=0, style={'marginBottom': '10px', 'marginRight': '10px'}),
-    dcc.Store(id='selected-row-store'),
-    html.Div(id='add-selected-status', style={'marginLeft': '12px', 'color': '#1976d2', 'fontWeight': 'bold'}),
+    # NOTE: watchlist callback is defined at module scope below. Keep layout-only logic here.
 
 
 
@@ -693,6 +686,7 @@ def handle_watchlist_table(remove_n_clicks, data_timestamp, refresh_n_clicks, se
      State('min-volume', 'value'),
      State('min-roi', 'value'),
      State('forecast-hours', 'value'),
+    State('forecast-recency-minutes', 'value'),
      State('volume-power', 'value'),
     State('max-qty-factor', 'value'),
      State('top-n', 'value'),
@@ -710,7 +704,7 @@ def handle_watchlist_table(remove_n_clicks, data_timestamp, refresh_n_clicks, se
     State('buy-price-type', 'value'),
     State('forecast-price-type', 'value'),]
 )
-def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist_input, item_name_search, forecast_strategy, min_profit, min_potential_profit, min_volume, min_roi, forecast_hours, volume_power, max_qty_factor, top_n, sort_attribute, trend_filter, forecast_sell_time, min_price, max_price, min_avg_daily_volume, max_avg_trade_time, table_data, template_selected, status_filter, risk_filter, buy_price_type, forecast_price_type):
+def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist_input, item_name_search, forecast_strategy, min_profit, min_potential_profit, min_volume, min_roi, forecast_hours, forecast_recency_minutes, volume_power, max_qty_factor, top_n, sort_attribute, trend_filter, forecast_sell_time, min_price, max_price, min_avg_daily_volume, max_avg_trade_time, table_data, template_selected, status_filter, risk_filter, buy_price_type, forecast_price_type):
     if forecast_sell_time is None:
         forecast_sell_time = 0
     
@@ -720,71 +714,7 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
     triggered = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
     print(f'[DEBUG] triggered: {triggered}')
     print(f'[DEBUG] Start of callback, time: {t_debug_start}')
-    # --- Handle watchlist cell click ---
-    print('[DEBUG] Before active_cell branch, time:', time.time() - t_debug_start)
-    if triggered == 'forecast-table.active_cell':
-        print('[DEBUG] forecast-table.active_cell triggered')
-        active_cell = ctx.inputs.get('forecast-table.active_cell')
-        print(f'[DEBUG] active_cell: {active_cell}')
-        print(f'[DEBUG] table_data: {table_data}')
-        if not active_cell or not table_data:
-            print('[DEBUG] No active_cell or table_data')
-            raise PreventUpdate
-        col = active_cell.get('column_id')
-        row = active_cell.get('row')
-        print(f'[DEBUG] col: {col}, row: {row}')
-        # Only handle if user clicked the add/remove cell
-        if col != 'add_to_watchlist' or row is None or row < 0 or row >= len(table_data):
-            print('[DEBUG] Not add_to_watchlist column or invalid row')
-            raise PreventUpdate
-        cell_value = table_data[row].get('add_to_watchlist')
-        print(f'[DEBUG] cell_value: {cell_value}')
-        if cell_value not in ['Add', 'Remove']:
-            print('[DEBUG] cell_value not Add/Remove')
-            raise PreventUpdate
-        item = table_data[row]
-        item_id = item.get('id')
-        print(f'[DEBUG] item_id: {item_id}')
-        if not item_id:
-            print('[DEBUG] No item_id')
-            raise PreventUpdate
-        # Load current watchlist
-        watchlist_path = os.path.join(APP_DIR, 'Data', 'watchlist.json')
-        try:
-            with open(watchlist_path, 'r', encoding='utf-8') as f:
-                watchlist = json.load(f)
-            print(f'[DEBUG] Loaded watchlist: {watchlist}')
-        except Exception as e:
-            print(f'[DEBUG] Failed to load watchlist: {e}')
-            watchlist = []
-        watchlist_ids = set(str(w.get('item_id')) for w in watchlist)
-        print(f'[DEBUG] watchlist_ids: {watchlist_ids}')
-        # Add or remove
-        if str(item_id) in watchlist_ids:
-            print('[DEBUG] Removing from watchlist')
-            watchlist = [w for w in watchlist if str(w.get('item_id')) != str(item_id)]
-            table_data[row]['add_to_watchlist'] = 'Add'
-        else:
-            print('[DEBUG] Adding to watchlist')
-            new_entry = {
-                'item_id': item_id,
-                'item_name': item.get('name', ''),
-                'entry_price': float(item.get('lowP', 0)),
-                'quantity': 1,
-                'added_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-            watchlist.append(new_entry)
-            table_data[row]['add_to_watchlist'] = 'Remove'
-        # Save updated watchlist
-        try:
-            with open(watchlist_path, 'w', encoding='utf-8') as f:
-                json.dump(watchlist, f, ensure_ascii=False, indent=2)
-            print('[DEBUG] Saved updated watchlist')
-        except Exception as e:
-            print(f"[ERROR] Failed to update watchlist: {e}")
-        from dash import no_update
-        print('[DEBUG] Returning updated table_data')
-        return table_data, no_update, no_update, no_update
+    # Forecast table cell-click watchlist logic is handled by dedicated watchlist callbacks.
     # Ensure filter_by_watchlist_input is always a list
     print('[DEBUG] Before filter_by_watchlist_input normalization, time:', time.time() - t_debug_start)
     if filter_by_watchlist_input is None:
@@ -794,7 +724,7 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
     # import time module already at top, avoid shadowing
     t0 = time.time()
     print(f'[DEBUG] update_table_and_times called! n_clicks={n_clicks}')
-    print(f'[DEBUG] filter params: item_name_search={item_name_search}, forecast_strategy={forecast_strategy}, min_profit={min_profit}, min_potential_profit={min_potential_profit}, min_volume={min_volume}, min_roi={min_roi}, forecast_hours={forecast_hours}, top_n={top_n}, sort_attribute={sort_attribute}, trend_filter={trend_filter}, forecast_sell_time={forecast_sell_time}, min_price={min_price}, max_price={max_price}, min_avg_daily_volume={min_avg_daily_volume}')
+    print(f'[DEBUG] filter params: item_name_search={item_name_search}, forecast_strategy={forecast_strategy}, min_profit={min_profit}, min_potential_profit={min_potential_profit}, min_volume={min_volume}, min_roi={min_roi}, forecast_hours={forecast_hours}, forecast_recency_minutes={forecast_recency_minutes}, top_n={top_n}, sort_attribute={sort_attribute}, trend_filter={trend_filter}, forecast_sell_time={forecast_sell_time}, min_price={min_price}, max_price={max_price}, min_avg_daily_volume={min_avg_daily_volume}')
     print('[DEBUG] After filter param print, time:', time.time() - t_debug_start)
     t1 = time.time()
     print(f'[DEBUG] Time after param print: {t1-t0:.3f}s')
@@ -848,9 +778,8 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
         #         fetch_needed = True
         if fetch_needed:
             try:
-                from fetch_5m_data import fetch_and_save_5m_data
-                fetch_and_save_5m_data()
-                print('[DEBUG] 5m data check/fetch complete.')
+                if fetch_and_save_5m_data_safe('item-name/watchlist'):
+                    print('[DEBUG] 5m data check/fetch complete.')
             except Exception as e:
                 print(f"Error fetching 5m data: {e}")
         t2b = time.time()
@@ -960,6 +889,7 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
                 'MIN_VOLUME_POTENTIAL': 0,
                 'MIN_FORECAST_ROI': 0,
                 'FORECAST_HOURS': forecast_hours,
+                'FORECAST_RECENCY_MINUTES': forecast_recency_minutes,
                 'STATUS_FILTER': status_filter_ctx,
                 'STATUS_FILTER_MODE': status_filter_mode,
                 'STATUS_EXCLUDE': status_exclude_ctx,
@@ -984,9 +914,8 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
         print('[DEBUG] Checking/fetching 5m data...')
         print('[DEBUG] Before analyze_forecast_gui call (apply-filters), time:', time.time() - t_debug_start)
         try:
-            from fetch_5m_data import fetch_and_save_5m_data
-            fetch_and_save_5m_data()
-            print('[DEBUG] 5m data check/fetch complete.')
+            if fetch_and_save_5m_data_safe('apply-filters'):
+                print('[DEBUG] 5m data check/fetch complete.')
         except Exception as e:
             print(f"Error fetching 5m data: {e}")
         t2b = time.time()
@@ -1031,6 +960,7 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
             'MIN_VOLUME_POTENTIAL': 0,
             'MIN_FORECAST_ROI': 0,
             'FORECAST_HOURS': forecast_hours,
+            'FORECAST_RECENCY_MINUTES': forecast_recency_minutes,
             'STATUS_FILTER': [],
             'STATUS_FILTER_MODE': 'include',
             'STATUS_EXCLUDE': [],
@@ -1115,53 +1045,53 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
         # Defensive: if data is not a list, return empty table and log error
         print('[ERROR] Data is not a list in update_table_and_times, returning empty table.')
         columns = [
-            {'name': 'id', 'id': 'id'},
-            {'name': 'name', 'id': 'name'},
-            {'name': 'lowP', 'id': 'lowP'},
-            {'name': 'highP', 'id': 'highP'},
-            {'name': 'lowTime', 'id': 'lowTime'},
-            {'name': 'highTime', 'id': 'highTime'},
-            {'name': 'rel_spread', 'id': 'rel_spread'},
-            {'name': 'forecast_price', 'id': 'forecast_price'},
-            {'name': 'profit', 'id': 'profit'},
-            {'name': 'roi', 'id': 'roi'},
-            {'name': 'avg_daily_volume', 'id': 'avg_daily_volume'},
-            {'name': 'buy_limit', 'id': 'buy_limit'},
-            {'name': 'max_qty', 'id': 'max_qty'},
-            {'name': 'potential_profit', 'id': 'potential_profit'},
-            {'name': 'volume_potential', 'id': 'volume_potential'},
-            {'name': 'trend_direction', 'id': 'trend_direction'},
-            {'name': 'risk_level', 'id': 'risk_level'},
-            {'name': 'status', 'id': 'status'},
-            {'name': 'lowVol_recent', 'id': 'lowVol_recent'},
-            {'name': 'highVol_recent', 'id': 'highVol_recent'},
-            {'name': 'buy_price', 'id': 'buy_price', 'hideable': False, 'hidden': True},
-            {'name': 'sell_price', 'id': 'sell_price', 'hideable': False, 'hidden': True},
+            {'name': 'ID', 'id': 'id'},
+            {'name': 'Name', 'id': 'name'},
+            {'name': 'Low Price', 'id': 'lowP'},
+            {'name': 'High Price', 'id': 'highP'},
+            {'name': 'Low Recency', 'id': 'lowTime'},
+            {'name': 'High Recency', 'id': 'highTime'},
+            {'name': 'Spread', 'id': 'rel_spread'},
+            {'name': 'Forecast Price', 'id': 'forecast_price'},
+            {'name': 'Profit', 'id': 'profit'},
+            {'name': 'ROI (%)', 'id': 'roi'},
+            {'name': 'Volume', 'id': 'avg_daily_volume'},
+            {'name': 'Buy Limit', 'id': 'buy_limit'},
+            {'name': 'Suggested Qty', 'id': 'max_qty'},
+            {'name': 'Potential Profit', 'id': 'potential_profit'},
+            {'name': 'Volume Potential', 'id': 'volume_potential'},
+            {'name': 'Trend', 'id': 'trend_direction'},
+            {'name': 'Risk Level', 'id': 'risk_level'},
+            {'name': 'Status', 'id': 'status'},
+            {'name': 'Recent Low Vol (%)', 'id': 'lowVol_recent'},
+            {'name': 'Recent High Vol (%)', 'id': 'highVol_recent'},
+            # {'name': 'Buy Price', 'id': 'buy_price', 'hideable': False, 'hidden': True},
+            # {'name': 'Sell Price', 'id': 'sell_price', 'hideable': False, 'hidden': True},
         ]
         update_text = 'No data available.'
         forecasted_prices_dict = {}
         return [], columns, update_text, forecasted_prices_dict
     columns = [
-        {'name': 'id', 'id': 'id'},
-        {'name': 'name', 'id': 'name'},
-        {'name': 'lowP', 'id': 'lowP'},
-        {'name': 'highP', 'id': 'highP'},
-        {'name': 'lowTime', 'id': 'lowTime'},
-        {'name': 'highTime', 'id': 'highTime'},
-        {'name': 'rel_spread', 'id': 'rel_spread'},
-        {'name': 'forecast_price', 'id': 'forecast_price'},
-        {'name': 'profit', 'id': 'profit'},
-        {'name': 'roi', 'id': 'roi'},
-        {'name': 'avg_daily_volume', 'id': 'avg_daily_volume'},
-        {'name': 'buy_limit', 'id': 'buy_limit'},
-        {'name': 'max_qty', 'id': 'max_qty'},
-        {'name': 'potential_profit', 'id': 'potential_profit'},
-        {'name': 'volume_potential', 'id': 'volume_potential'},
-        {'name': 'trend_direction', 'id': 'trend_direction'},
-        {'name': 'risk_level', 'id': 'risk_level'},
-        {'name': 'status', 'id': 'status'},
-        {'name': 'lowVol_recent', 'id': 'lowVol_recent'},
-        {'name': 'highVol_recent', 'id': 'highVol_recent'},
+        {'name': 'Item ID', 'id': 'id'},
+        {'name': 'Item Name', 'id': 'name'},
+        {'name': 'Low Price', 'id': 'lowP'},
+        {'name': 'High Price', 'id': 'highP'},
+        {'name': 'Low Updated', 'id': 'lowTime'},
+        {'name': 'High Updated', 'id': 'highTime'},
+        {'name': 'Spread (%)', 'id': 'rel_spread'},
+        {'name': 'Forecast Price', 'id': 'forecast_price'},
+        {'name': 'Forecast Profit', 'id': 'profit'},
+        {'name': 'ROI (%)', 'id': 'roi'},
+        {'name': 'Avg Daily Volume', 'id': 'avg_daily_volume'},
+        {'name': 'Buy Limit', 'id': 'buy_limit'},
+        {'name': 'Suggested Qty', 'id': 'max_qty'},
+        {'name': 'Potential Profit', 'id': 'potential_profit'},
+        {'name': 'Volume Potential', 'id': 'volume_potential'},
+        {'name': 'Trend', 'id': 'trend_direction'},
+        {'name': 'Risk Level', 'id': 'risk_level'},
+        {'name': 'Status', 'id': 'status'},
+        {'name': 'Recent Low Vol (%)', 'id': 'lowVol_recent'},
+        {'name': 'Recent High Vol (%)', 'id': 'highVol_recent'},
         {'name': 'buy_price', 'id': 'buy_price', 'hideable': False, 'hidden': True},
         {'name': 'sell_price', 'id': 'sell_price', 'hideable': False, 'hidden': True},
     ]
@@ -1319,7 +1249,7 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
         new_row['lowVol_recent'] = row.get('lowVol_recent', '')
         new_row['highVol_recent'] = row.get('highVol_recent', '')
         # Status logic + manipulation warning + spike detection
-        status = ''
+        status = str(row.get('status', '') or '').strip()
         try:
             fp = float(row.get('forecast_price', 0))
             profit = float(row.get('profit', 0))
@@ -1342,7 +1272,6 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
             #     status = 'Low ROI'
             # else:
             #     status = 'OK'
-            status = ''
             # Manipulation detection
             if rel_spread > 20:
                 manipulation = True
@@ -1441,8 +1370,9 @@ def update_table_and_times(item_name_search_input, n_clicks, filter_by_watchlist
             except Exception as e:
                 print(f'[DEBUG] Error in spike detection for item {row.get("id", "")}: {e}')
 
-            if manipulation:
-                status += ' ⚠ Possible manipulation! ' + '; '.join(warning_msgs)
+            if manipulation and warning_msgs:
+                warning_text = '; '.join(warning_msgs)
+                status = f"{status} | ⚠ Possible manipulation! {warning_text}" if status else f"⚠ Possible manipulation! {warning_text}"
 
             if status == '':
                 status = 'Normal'
@@ -2032,6 +1962,7 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
         Output('min-volume', 'value'),
         Output('min-roi', 'value'),
         Output('forecast-hours', 'value'),
+        Output('forecast-recency-minutes', 'value'),
         Output('volume-power', 'value'),
         Output('max-qty-factor', 'value'),
         Output('trend-filter', 'value'),
@@ -2056,6 +1987,7 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
      State('min-volume', 'value'),
      State('min-roi', 'value'),
      State('forecast-hours', 'value'),
+    State('forecast-recency-minutes', 'value'),
      State('volume-power', 'value'),
     State('max-qty-factor', 'value'),
      State('trend-filter', 'value'),
@@ -2069,7 +2001,7 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
 )
 def template_save_load_callback(save_clicks, load_clicks, delete_clicks, template_name,
     forecast_strategy, forecast_sell_time, min_price, max_price, min_avg_daily_volume, max_avg_trade_time, min_profit,
-    min_potential_profit, min_volume, min_roi, forecast_hours, volume_power, max_qty_factor, trend_filter,
+    min_potential_profit, min_volume, min_roi, forecast_hours, forecast_recency_minutes, volume_power, max_qty_factor, trend_filter,
     top_n, sort_attribute, risk_filter, status_filter, buy_price_type, forecast_price_type, selected_template):
     ctx = dash.callback_context
     if not ctx.triggered:
@@ -2083,7 +2015,7 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
         # List of all filter input IDs in the UI (update this list as you add new filters)
         filter_ids = [
             'forecast_strategy', 'forecast_sell_time', 'min_price', 'max_price', 'min_avg_daily_volume', 'max_avg_trade_time', 'min_profit',
-            'min_potential_profit', 'min_volume', 'min_roi', 'forecast_hours', 'volume_power', 'max_qty_factor', 'trend_filter',
+            'min_potential_profit', 'min_volume', 'min_roi', 'forecast_hours', 'forecast_recency_minutes', 'volume_power', 'max_qty_factor', 'trend_filter',
             'top_n', 'sort_attribute', 'risk_filter', 'status_filter', 'buy_price_type', 'forecast_price_type'
         ]
         # Map input IDs to their values from the function arguments or dash callback context
@@ -2099,6 +2031,7 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
             'min_volume': min_volume,
             'min_roi': min_roi,
             'forecast_hours': forecast_hours,
+            'forecast_recency_minutes': forecast_recency_minutes,
             'volume_power': volume_power,
             'max_qty_factor': max_qty_factor,
             'trend_filter': trend_filter,
@@ -2124,18 +2057,18 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
         success = save_filter_template(template_name, values)
         status = f"Template '{template_name}' saved." if success else f"Error saving template '{template_name}'."
         options = [{'label': name, 'value': name} for name in list_filter_templates()]
-        return [status, options, template_name] + [dash.no_update]*21
+        return [status, options, template_name] + [dash.no_update]*22
     # Load template (auto-include all filter fields)
     elif trigger == 'load-template':
         if not load_clicks or not selected_template:
             raise PreventUpdate
         template = load_filter_template(selected_template)
         if not template:
-            return [f"Template '{selected_template}' not found.", options, selected_template] + [dash.no_update]*19
+            return [f"Template '{selected_template}' not found.", options, selected_template] + [dash.no_update]*22
         # List of all filter output order (must match callback Outputs)
         output_order = [
             'forecast_strategy', 'forecast_sell_time', 'min_price', 'max_price', 'min_avg_daily_volume', 'max_avg_trade_time',  'min_profit',
-            'min_potential_profit', 'min_volume', 'min_roi', 'forecast_hours', 'volume_power', 'max_qty_factor', 'trend_filter',
+            'min_potential_profit', 'min_volume', 'min_roi', 'forecast_hours', 'forecast_recency_minutes', 'volume_power', 'max_qty_factor', 'trend_filter',
             'top_n', 'sort_attribute', 'risk_filter', 'status_filter', 'buy_price_type', 'forecast_price_type', 'template_name'
         ]
         # Build result list in output order, using template values or defaults
@@ -2151,6 +2084,7 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
             'min_volume': 6,
             'min_roi': 5,
             'forecast_hours': 72,
+            'forecast_recency_minutes': 0,
             'volume_power': 1,
             'max_qty_factor': 1,
             'trend_filter': '',
@@ -2165,10 +2099,10 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
         result = [f"Template '{selected_template}' loaded.", options, selected_template]
         for key in output_order:
             result.append(template.get(key, defaults.get(key, dash.no_update)))
-        # Ensure result is exactly the right length (3 fixed + 21 filter values)
-        while len(result) < 24:
+        # Ensure result is exactly the right length (3 fixed + 22 filter values)
+        while len(result) < 25:
             result.append(dash.no_update)
-        return result[:24]
+        return result[:25]
     # Delete template
     elif trigger == 'delete-template':
         if not delete_clicks or not selected_template:
@@ -2176,49 +2110,10 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
         success = delete_filter_template(selected_template)
         options = [{'label': name, 'value': name} for name in list_filter_templates()]
         status = f"Template '{selected_template}' deleted." if success else f"Error deleting template '{selected_template}'."
-        return [status, options, None] + [dash.no_update]*19
+        return [status, options, None] + [dash.no_update]*22
     raise PreventUpdate
 
 # --- Watchlist Add/Remove Callback ---
-@app.callback(
-    # [Output('remove-selected-status', 'children'), Output('watchlist-table', 'data')],
-    [Input('remove-selected-from-watchlist-btn', 'n_clicks')],
-    [State('watchlist-table', 'selected_rows'), State('watchlist-table', 'data')]
-)
-def remove_selected_from_watchlist(n_clicks, selected_rows, table_data):
-    print('[DEBUG] remove_selected_from_watchlist called')
-    if n_clicks and n_clicks > 0:
-        if not selected_rows or not table_data:
-            print('[DEBUG] No selected row or table data')
-            return 'No row selected.', table_data
-        row_idx = selected_rows[0] if isinstance(selected_rows, list) and selected_rows else None
-        if row_idx is None or row_idx < 0 or row_idx >= len(table_data):
-            print(f'[DEBUG] Invalid row index: {row_idx}')
-            return 'Invalid row selected.', table_data
-        item = table_data[row_idx]
-        item_id = item.get('item_id')
-        item_name = item.get('item_name', '')
-        watchlist_path = os.path.join(APP_DIR, 'Data', 'watchlist.json')
-        try:
-            with open(watchlist_path, 'r', encoding='utf-8') as f:
-                watchlist = json.load(f)
-        except Exception:
-            watchlist = []
-        # Remove item
-        new_watchlist = [w for w in watchlist if str(w.get('item_id')) != str(item_id)]
-        if len(new_watchlist) == len(watchlist):
-            print(f'[DEBUG] Item {item_id} not found in watchlist')
-            return f'Item {item_name} not found in watchlist.', table_data
-        try:
-            with open(watchlist_path, 'w', encoding='utf-8') as f:
-                json.dump(new_watchlist, f, ensure_ascii=False, indent=2)
-            print(f'[DEBUG] Removed {item_name} from watchlist')
-            return f'Removed {item_name} from watchlist.', new_watchlist
-        except Exception as e:
-            print(f'[ERROR] Failed to save watchlist: {e}')
-            return f'Error saving watchlist: {e}', table_data
-    print('[DEBUG] Button not clicked yet')
-    return dash.no_update, table_data
 @app.callback(
     Output('add-selected-status', 'children'),
     [Input('add-selected-to-watchlist-btn', 'n_clicks')],
@@ -2244,7 +2139,6 @@ def add_selected_to_watchlist(n_clicks, selected_rows, table_data):
                 watchlist = json.load(f)
         except Exception:
             watchlist = []
-        # Check for existing item
         existing_item = next((w for w in watchlist if str(w.get('item_id')) == str(item_id)), None)
         if existing_item:
             print(f'[DEBUG] Item {item_id} already in watchlist')
@@ -2273,40 +2167,7 @@ def add_selected_to_watchlist(n_clicks, selected_rows, table_data):
 ## Removed all callbacks referencing watchlist-table (pagination, sorting, data, etc.)
 
 
-# --- Unified debug callback for add-watchlist-status.children ---
-@app.callback(
-    # ...existing code...
-    [
-        Input('forecast-table', 'active_cell'),
-        Input('forecast-table', 'data'),
-        Input('item-name-search', 'value'),
-        Input('filter-by-watchlist', 'value'),
-        Input('apply-filters', 'n_clicks'),
-        Input('refresh-interval', 'n_intervals'),
-        Input('save-template', 'n_clicks'),
-        Input('load-template', 'n_clicks'),
-        Input('delete-template', 'n_clicks'),
-        # Input('watchlist-table', 'page_current'),
-        # Input('watchlist-table', 'page_size'),
-        # Input('watchlist-table', 'sort_by'),
-        # Input('watchlist-table', 'data'),
-        # Input('watchlist-table', 'active_cell'),
-    ],
-    [
-        State('forecast-table', 'data'),
-        # State('watchlist-table', 'data')
-    ]
-)
-def unified_watchlist_status(
-    forecast_active_cell, forecast_table_data, item_name_search, filter_by_watchlist, apply_filters_clicks,
-    refresh_interval, save_template_clicks, load_template_clicks, delete_template_clicks,
-    # watchlist_page_current, watchlist_page_size, 
-    # watchlist_sort_by, watchlist_table_data, watchlist_active_cell,
-    state_forecast_table_data
-):
-    ctx = dash.callback_context
-    # All branches removed; do not return anything for no-output callback
-    pass
+# Removed no-output debug callback that could break callback registration.
 
 
 
@@ -2405,14 +2266,12 @@ if __name__ == '__main__':
                 return False
 
         try:
-            from fetch_5m_data import fetch_and_save_5m_data    
             if not latest_chunk_is_current():
-                fetch_and_save_5m_data()
-            else:   
+                fetch_and_save_5m_data_safe('startup')
+            else:
                 print("5m data is already up to date on startup.")
         except Exception as e:
             print(f"Error fetching 5m data on startup: {e}")
-            traceback.print_exc()
         
         print("[DEBUG] Starting Dash app...")
         app.run(
