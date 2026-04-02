@@ -41,27 +41,28 @@ def forecast_avg_price(hist, minutes_ahead=60, strategy='wma', latest_prices=Non
     if not prices:
         return []
 
-    MAX_POINTS = {
-        'wma': 200,
-        'ewma': 200,
-        'wma_trend': 200,
-        'linear': 200,
-        'poly': 200,
-        'brown': 200,
-        'holt_winters': 96,
-        'arima': 80,
-        'sarimax': 80,
-        'prophet': 120,
-        'lstm': 120,
-        'rnn': 120,
-        'cnn': 120,
-        'nbeats': 120,
-        'mix': 2016,  # allow 7d context
-    }
+    # Limit was to prevent overloading complex models with too much data, but it can be counterproductive for robust methods that benefit from more history. Instead, we rely on the models' internal mechanisms (like EWMA's alpha or Holt-Winters' seasonality) to handle noise and focus on recent trends. If performance becomes an issue, we can revisit this with a more dynamic approach based on data characteristics rather than a hard cutoff.
+    # MAX_POINTS = {
+    #     'wma': 200,
+    #     'ewma': 200,
+    #     'wma_trend': 200,
+    #     'linear': 200,
+    #     'poly': 200,
+    #     'brown': 200,
+    #     'holt_winters': 96,
+    #     'arima': 80,
+    #     'sarimax': 80,
+    #     'prophet': 120,
+    #     'lstm': 120,
+    #     'rnn': 120,
+    #     'cnn': 120,
+    #     'nbeats': 120,
+    #     'mix': 2016,  # allow 7d context
+    # }
 
-    limit = MAX_POINTS.get(strategy)
-    if limit:
-        prices = prices[-limit:]
+    # limit = MAX_POINTS.get(strategy)
+    # if limit:
+    #     prices = prices[-limit:]
 
     interval_minutes = 60 if minutes_ahead > 180 else 5
     steps = max(1, int(minutes_ahead // interval_minutes))
@@ -299,7 +300,7 @@ def wma(prices, steps = 20, wma_factor = 20, preds = []):
         print("WMA forecast error:", e)
         return preds
 
-def ewma(prices, steps = 20, alpha = 0.5, preds = []):
+def ewma(prices, steps = 20, alpha = 0.1, preds = []):
     if (steps) == 0:
         return preds
     ewma_value = prices[0]
@@ -444,6 +445,12 @@ def holt_winters_forecast(prices_, steps=20):
         return []
     prices = np.where(prices <= 0, 1e-6, prices)
 
+
+    # Clip outliers before fitting
+    q_low = np.percentile(prices, 5)
+    q_high = np.percentile(prices, 95)
+    prices = np.clip(prices, q_low, q_high)
+
     seasonal_period = cached_seasonality(tuple(prices))
 
     # seasonal_period = None
@@ -461,7 +468,7 @@ def holt_winters_forecast(prices_, steps=20):
             prices,
             trend='add',
             damped_trend=True,
-            seasonal='add',
+            seasonal='mul',
             seasonal_periods=seasonal_period,
             initialization_method='estimated'
         )
@@ -469,17 +476,6 @@ def holt_winters_forecast(prices_, steps=20):
         
     model_fit = model.fit(optimized=True)
     forecast = model_fit.forecast(steps)
-
-    # --- ROBUST CLAMP BASELINE ---
-    baseline = np.median(prices[-12:])   # spike-resistant
-
-    MAX_UP = 1.20
-    MAX_DOWN = 0.80
-
-    upper = baseline * MAX_UP
-    lower = baseline * MAX_DOWN
-
-    forecast = np.clip(forecast, lower, upper)
 
     return np.floor(forecast).astype(int).tolist()
 
