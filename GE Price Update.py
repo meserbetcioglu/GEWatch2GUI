@@ -34,8 +34,7 @@ def first_update(dir):
   bulk_prices_history[h_list['timestamp']] = h_list
 
   try:
-      with open(dir, "w") as file:
-          json.dump(bulk_prices_history, file)
+      _atomic_json_dump(dir, bulk_prices_history)
   except Exception as e: # Simplified try-except, removed redundant file.close()
       logger.error(f"Error saving initial price history: {e}")
 
@@ -48,23 +47,15 @@ def remove_past_price(dir):
 
     logger.info('============ Remove past price starting ============')
 
-    #90 Days is the history limit. The current GEWatch uses 7 days of data, so you may edit this.
-    dt_90d = datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0) - datetime.timedelta(days = 8)
+    # Keep a wider retention window so charting can zoom out well beyond 1 month.
+    retention_days = 90
+    cutoff_dt = datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0) - datetime.timedelta(days=retention_days)
 
-    try:
-      with open(dir, "r") as file:
-          bulk_prices_history = json.load(file)
-    except FileNotFoundError:
-        logger.warning('Price history not found.')
-        return {}
-    except json.JSONDecodeError:
-        logger.error('Error decoding JSON from price history file. File might be corrupted.')
-        return {}
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while loading price history: {e}")
+    bulk_prices_history = _load_price_history_with_recovery(dir)
+    if not bulk_prices_history:
         return {}
 
-    past_prices_history = {key:bulk_prices_history[key] for key in bulk_prices_history if datetime.datetime.strptime(key, '%Y-%m-%d %H:%M:%S') < dt_90d}
+    past_prices_history = {key:bulk_prices_history[key] for key in bulk_prices_history if datetime.datetime.strptime(key, '%Y-%m-%d %H:%M:%S') < cutoff_dt}
 
     if len(past_prices_history.keys()) > 0:
         logger.info(f'Earliest found invalid date: {min(past_prices_history.keys())}')
@@ -76,16 +67,98 @@ def remove_past_price(dir):
         logger.warning('Price history not found.')
         return {}
 
-    bulk_prices_history = {key:bulk_prices_history[key] for key in bulk_prices_history if datetime.datetime.strptime(key, '%Y-%m-%d %H:%M:%S') >= dt_90d}
+    bulk_prices_history = {key:bulk_prices_history[key] for key in bulk_prices_history if datetime.datetime.strptime(key, '%Y-%m-%d %H:%M:%S') >= cutoff_dt}
 
     logger.info(f'History cleaned, {min(bulk_prices_history.keys())} to {max(bulk_prices_history.keys())} is left.')
 
     return bulk_prices_history
 
+
+def backfill_min_history(dir, bulk_prices_history, min_days=90):
+
+    if not bulk_prices_history:
+        return bulk_prices_history
+
+    logger.info(f'============ Backfill history to at least {min_days} days ============')
+
+    target_oldest = datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0) - datetime.timedelta(days=min_days)
+    save_every = 24
+    fetched = 0
+
+    while True:
+        try:
+            oldest_str = min(bulk_prices_history.keys())
+            oldest_dt = datetime.datetime.strptime(oldest_str, '%Y-%m-%d %H:%M:%S')
+        except Exception as e:
+            logger.error(f'Could not parse oldest timestamp for backfill: {e}')
+            break
+
+        if oldest_dt <= target_oldest:
+            break
+
+        requested_dt = oldest_dt - datetime.timedelta(hours=1)
+        requested_ts = int(requested_dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+        try:
+            h_list = json.loads(request('https://prices.runescape.wiki/api/v1/osrs/1h', params={'timestamp': requested_ts}))
+            returned_ts = datetime.datetime.utcfromtimestamp(h_list['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+            if returned_ts in bulk_prices_history:
+                logger.warning(f'Backfill returned duplicate timestamp {returned_ts}; stopping backfill to avoid infinite loop.')
+                break
+            h_list['timestamp'] = returned_ts
+            bulk_prices_history[returned_ts] = h_list
+            fetched += 1
+            logger.info(f'Backfilled: {returned_ts}')
+        except Exception as e:
+            logger.error(f'Backfill request failed for {requested_dt}: {e}')
+            break
+
+        if fetched % save_every == 0:
+            try:
+                _atomic_json_dump(dir, bulk_prices_history)
+            except Exception as e:
+                logger.error(f'Error saving during backfill: {e}')
+
+        # Small pause to stay friendly to the API while backfilling.
+        time.sleep(0.25)
+
+    if fetched > 0:
+        try:
+            _atomic_json_dump(dir, bulk_prices_history)
+        except Exception as e:
+            logger.error(f'Error saving final backfill data: {e}')
+
+    logger.info(f'Backfill complete. Added {fetched} hourly points.')
+    return bulk_prices_history
+
+
+def bootstrap_history_from_latest_hour(dir):
+    logger.info('============ Bootstrap history from latest hour ============')
+    target_dt = datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
+    target_timestamp = int(target_dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+    try:
+        h_list = json.loads(request('https://prices.runescape.wiki/api/v1/osrs/1h', params={'timestamp': target_timestamp}))
+        h_list['timestamp'] = datetime.datetime.utcfromtimestamp(h_list['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+        bulk_prices_history = {h_list['timestamp']: h_list}
+        _atomic_json_dump(dir, bulk_prices_history)
+        logger.info(f"Bootstrapped history with: {h_list['timestamp']}")
+        return bulk_prices_history
+    except Exception as e:
+        logger.error(f'Bootstrap failed: {e}')
+        return {}
+
 def update_to_latest_price(dir, bulk_prices_history, last_time = None):
 
     if bulk_prices_history == None or len(bulk_prices_history) == 0:
-      bulk_prices_history = first_update(dir)
+        logger.warning('No usable history found; bootstrapping from latest available hour.')
+        bulk_prices_history = bootstrap_history_from_latest_hour(dir)
+        if not bulk_prices_history:
+            logger.error('Cannot continue update_to_latest_price without bootstrap data.')
+            return
+
+    # Ensure minimum history depth so GUI charts can show long-window trends.
+    bulk_prices_history = backfill_min_history(dir, bulk_prices_history, min_days=90)
 
 
     logger.info('============ Update to latest price starting ============')
@@ -135,8 +208,7 @@ def update_to_latest_price(dir, bulk_prices_history, last_time = None):
             logger.info('Starting to save, do not close.')
             now = datetime.datetime.timestamp(datetime.datetime.now())
             try:
-                with open(dir, "w") as file:
-                    json.dump(bulk_prices_history, file)
+                _atomic_json_dump(dir, bulk_prices_history)
             except Exception as e: # Simplified try-except, removed redundant file.close()
                 logger.error(f"Error saving price history: {e}")
             logger.info(f'Finished saving. Took {int(datetime.datetime.timestamp(datetime.datetime.now()) - now)} seconds.')
@@ -149,8 +221,7 @@ def update_to_latest_price(dir, bulk_prices_history, last_time = None):
         logger.info('Starting the final save, do not close.')
         now = datetime.datetime.timestamp(datetime.datetime.now())
         try:
-            with open(dir, "w") as file:
-                json.dump(bulk_prices_history, file)
+            _atomic_json_dump(dir, bulk_prices_history)
         except Exception as e: # Simplified try-except, removed redundant file.close()
             logger.error(f"Error saving final price history: {e}")
         logger.info(f'Finished saving. Took {int(datetime.datetime.timestamp(datetime.datetime.now()) - now)} seconds.')
@@ -159,18 +230,13 @@ def update_price(dir):
 
     logger.info('============ Update price starting ============')
 
-    try:
-        with open(dir, "r") as file:
-            bulk_prices_history = json.load(file)
-    except FileNotFoundError:
-        logger.error('Price history file not found. Please run first_update or update_to_latest_price first.')
-        return
-    except json.JSONDecodeError:
-        logger.error('Error decoding JSON from price history file. File might be corrupted.')
-        return # Decide how to handle corrupted file: start fresh? try to recover?
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while loading price history: {e}")
-        return
+    bulk_prices_history = _load_price_history_with_recovery(dir)
+    if not bulk_prices_history:
+        logger.warning('Price history unavailable after recovery attempts; trying bootstrap.')
+        bulk_prices_history = bootstrap_history_from_latest_hour(dir)
+        if not bulk_prices_history:
+            logger.error('Price history is still unavailable after bootstrap.')
+            return
 
     i = 1
     while(True):
@@ -216,8 +282,7 @@ def update_price(dir):
             logger.info('Starting save, do not close.')
             now = datetime.datetime.timestamp(datetime.datetime.now())
             try:
-                with open(dir, "w") as file:
-                    json.dump(bulk_prices_history, file)
+                _atomic_json_dump(dir, bulk_prices_history)
             except Exception as e:
                 logger.error(f"Error saving price history: {e}")
             logger.info(f'Finished saving. Took {int(datetime.datetime.timestamp(datetime.datetime.now()) - now)} seconds.')
@@ -243,6 +308,8 @@ import os
 import sys
 import datetime
 import logging
+import argparse
+import shutil
 # from google.colab import drive
 # drive.mount('/content/drive')
 
@@ -267,6 +334,69 @@ logger = logging.getLogger(__name__)
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
 
+def _price_history_backup_path(path):
+    return f"{path}.bak"
+
+
+def _atomic_json_dump(path, payload):
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, 'w', encoding='utf-8') as file:
+        json.dump(payload, file)
+        file.flush()
+        os.fsync(file.fileno())
+
+    try:
+        if os.path.exists(path):
+            try:
+                shutil.copy2(path, _price_history_backup_path(path))
+            except Exception as e:
+                logger.warning(f"Could not refresh backup file before replace: {e}")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _load_price_history_with_recovery(path):
+    backup_path = _price_history_backup_path(path)
+
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        logger.warning('Price history file not found.')
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f'Error decoding primary price history JSON: {e}')
+    except Exception as e:
+        logger.error(f'Unexpected error while loading primary price history: {e}')
+
+    if not os.path.exists(backup_path):
+        logger.error('No backup price history file available for recovery.')
+        return {}
+
+    try:
+        with open(backup_path, 'r', encoding='utf-8') as file:
+            backup_data = json.load(file)
+        if not isinstance(backup_data, dict):
+            logger.error('Backup price history file is not a JSON object.')
+            return {}
+        logger.warning('Recovered price history from backup file.')
+        try:
+            _atomic_json_dump(path, backup_data)
+        except Exception as restore_err:
+            logger.warning(f'Could not restore primary file from backup: {restore_err}')
+        return backup_data
+    except Exception as e:
+        logger.error(f'Failed to load backup price history file: {e}')
+        return {}
+
+
 
 
 
@@ -276,8 +406,22 @@ if not os.path.exists(os.path.join(dir_path, 'Data')):
 
 
 
-#latest_flag = input('[Y] to update to latest.')
+def main():
+    parser = argparse.ArgumentParser(description='OSRS price history updater')
+    parser.add_argument('--backfill-only', action='store_true', help='Backfill history and exit without starting hourly loop')
+    parser.add_argument('--min-days', type=int, default=90, help='Minimum history days to backfill when --backfill-only is used')
+    args = parser.parse_args()
 
-update_to_latest_price(data_dir, remove_past_price(data_dir))
-#if latest_flag == 'Y': update_to_latest_price(data_dir)
-update_price(data_dir)
+    cleaned_history = remove_past_price(data_dir)
+
+    if args.backfill_only:
+        backfill_min_history(data_dir, cleaned_history, min_days=max(1, args.min_days))
+        logger.info('Backfill-only mode complete.')
+        return
+
+    update_to_latest_price(data_dir, cleaned_history)
+    update_price(data_dir)
+
+
+if __name__ == '__main__':
+    main()

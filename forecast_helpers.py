@@ -41,28 +41,7 @@ def forecast_avg_price(hist, minutes_ahead=60, strategy='wma', latest_prices=Non
     if not prices:
         return []
 
-    # Limit was to prevent overloading complex models with too much data, but it can be counterproductive for robust methods that benefit from more history. Instead, we rely on the models' internal mechanisms (like EWMA's alpha or Holt-Winters' seasonality) to handle noise and focus on recent trends. If performance becomes an issue, we can revisit this with a more dynamic approach based on data characteristics rather than a hard cutoff.
-    # MAX_POINTS = {
-    #     'wma': 200,
-    #     'ewma': 200,
-    #     'wma_trend': 200,
-    #     'linear': 200,
-    #     'poly': 200,
-    #     'brown': 200,
-    #     'holt_winters': 96,
-    #     'arima': 80,
-    #     'sarimax': 80,
-    #     'prophet': 120,
-    #     'lstm': 120,
-    #     'rnn': 120,
-    #     'cnn': 120,
-    #     'nbeats': 120,
-    #     'mix': 2016,  # allow 7d context
-    # }
 
-    # limit = MAX_POINTS.get(strategy)
-    # if limit:
-    #     prices = prices[-limit:]
 
     interval_minutes = 60 if minutes_ahead > 180 else 5
     steps = max(1, int(minutes_ahead // interval_minutes))
@@ -120,7 +99,18 @@ def forecast_avg_price(hist, minutes_ahead=60, strategy='wma', latest_prices=Non
                 bound_frac=0.20
             )
 
-    return STRATEGIES[strategy]()
+    # ---- VOLUME PERCENTILE MEDIAN: needs raw hist entries, dispatched before STRATEGIES ----
+    if strategy == 'volume_percentile_median':
+        return volume_percentile_median_forecast(hist, steps, forecast_price_type=forecast_price_type)
+
+    try:
+        return STRATEGIES[strategy]()
+    except (RuntimeWarning, FloatingPointError, ZeroDivisionError, ValueError, LinAlgError):
+        # Keep per-item forecasting resilient when numerical models encounter bad local data.
+        fallback = robust_ewma(prices, steps=steps, alpha=0.3, window=min(20, len(prices)), clip_sigma=1.5)
+        if fallback:
+            return [int(math.floor(float(v))) for v in fallback]
+        return [int(prices[-1])] * steps
 import numpy as np
 
 def median_reversion_forecast_weekly(
@@ -179,6 +169,91 @@ def median_reversion_forecast_weekly(
         current = next_price
 
     return forecast
+
+def volume_percentile_median_forecast(hist, steps, forecast_price_type='avg', percentile=0.15, direction='high'):
+    """
+    Forecast using a volume-weighted percentile median.
+
+    direction='high'  → top `percentile` of volume sorted by price (sell ceiling).
+                        Uses forecast_price_type to select price per candle.
+    direction='low'   → bottom `percentile` of volume sorted by price (buy floor).
+                        Always uses low prices regardless of forecast_price_type.
+
+    Momentary spikes that traded only a handful of units have negligible weight;
+    candles with heavy volume dominate the selected percentile band.
+    """
+    entries = []
+    for e in hist:
+        highP = float(e.get('avgHighPrice') or 0)
+        highV = float(e.get('highPriceVolume') or 0)
+        lowP  = float(e.get('avgLowPrice') or 0)
+        lowV  = float(e.get('lowPriceVolume') or 0)
+
+        if direction == 'low':
+            # Buy-side: always use low prices
+            price = lowP
+            vol   = lowV
+        elif forecast_price_type == 'high':
+            price = highP
+            vol   = highV
+        elif forecast_price_type == 'low':
+            price = lowP
+            vol   = lowV
+        else:  # 'avg' — volume-weighted average price
+            total_v = highV + lowV
+            if total_v <= 0:
+                continue
+            price = (highP * highV + lowP * lowV) / total_v
+            vol   = total_v
+
+        if price > 0 and vol > 0:
+            entries.append((price, vol))
+
+    if not entries:
+        return []
+
+    entries.sort(key=lambda x: x[0])
+
+    total_volume  = sum(v for _, v in entries)
+    target_volume = total_volume * percentile
+
+    selected = []
+    acc = 0.0
+    if direction == 'low':
+        # Walk from LOWEST price upward — bottom percentile is the buy floor
+        for price, vol in entries:
+            remaining = target_volume - acc
+            if remaining <= 0:
+                break
+            absorbed = min(vol, remaining)
+            selected.append((price, absorbed))
+            acc += absorbed
+    else:
+        # Walk from HIGHEST price downward — top percentile is the sell ceiling
+        for price, vol in reversed(entries):
+            remaining = target_volume - acc
+            if remaining <= 0:
+                break
+            absorbed = min(vol, remaining)
+            selected.append((price, absorbed))
+            acc += absorbed
+
+    if not selected:
+        return []
+
+    # Volume-weighted median within the selected percentile band
+    selected.sort(key=lambda x: x[0])
+    total_sel_vol = sum(v for _, v in selected)
+    mid = total_sel_vol / 2.0
+    cum = 0.0
+    forecast_val = selected[0][0]
+    for price, vol in selected:
+        cum += vol
+        if cum >= mid:
+            forecast_val = price
+            break
+
+    return [int(forecast_val)] * steps
 
 # --- Darts ML Forecasting Wrapper ---
 def darts_forecast(prices, steps, model_name='LSTM'):
@@ -435,49 +510,82 @@ def arima_forecast(prices, steps=20):
 def holt_winters_forecast(prices_, steps=20):
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
     import numpy as np
-    import math
-
     prices = np.asarray(prices_, dtype=float)
-
     prices = prices[np.isfinite(prices)]
 
-    if len(prices) < 6:
+    if steps <= 0 or len(prices) < 6:
         return []
+
     prices = np.where(prices <= 0, 1e-6, prices)
 
+    # Flat/near-flat series often make HW numerically unstable; return flat forecast.
+    if np.nanstd(prices) < 1e-9:
+        return [int(math.floor(float(prices[-1])))] * steps
 
     # Clip outliers before fitting
     q_low = np.percentile(prices, 5)
     q_high = np.percentile(prices, 95)
     prices = np.clip(prices, q_low, q_high)
+    prices = np.where(prices <= 0, 1e-6, prices)
 
-    seasonal_period = cached_seasonality(tuple(prices))
-
-    # seasonal_period = None
-
-    if seasonal_period is None:
-        model = ExponentialSmoothing(
-            prices,
-            trend='add',
-            damped_trend=True,
-            seasonal=None,
-            initialization_method='estimated'
-        )
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error', category=RuntimeWarning)
+            seasonal_period = cached_seasonality(tuple(prices))
+    except (RuntimeWarning, FloatingPointError, ValueError, ZeroDivisionError):
+        seasonal_period = None
+    if isinstance(seasonal_period, (int, np.integer)):
+        if seasonal_period < 2 or len(prices) < (seasonal_period * 2):
+            seasonal_period = None
     else:
-        model = ExponentialSmoothing(
-            prices,
-            trend='add',
-            damped_trend=True,
-            seasonal='mul',
-            seasonal_periods=seasonal_period,
-            initialization_method='estimated'
-        )
+        seasonal_period = None
 
-        
-    model_fit = model.fit(optimized=True)
-    forecast = model_fit.forecast(steps)
+    model_configs = []
+    if seasonal_period is not None:
+        model_configs.append(dict(trend='add', damped_trend=True, seasonal='mul', seasonal_periods=int(seasonal_period), initialization_method='estimated'))
+    model_configs.append(dict(trend='add', damped_trend=True, seasonal=None, initialization_method='estimated'))
+    model_configs.append(dict(trend=None, damped_trend=False, seasonal=None, initialization_method='estimated'))
 
-    return np.floor(forecast).astype(int).tolist()
+    def _fit_holt_winters_with_bounds(model, is_seasonal):
+        # Keep full history, but bound optimizer work to avoid rare long-running items.
+        fit_kwargs = {
+            'optimized': True,
+            'use_brute': False,
+        }
+        fit_kwargs['minimize_kwargs'] = {'options': {'maxiter': 100 if is_seasonal else 60}}
+
+        try:
+            return model.fit(**fit_kwargs)
+        except TypeError:
+            # Compatibility fallback for older statsmodels versions.
+            try:
+                return model.fit(optimized=True, use_brute=False)
+            except TypeError:
+                return model.fit(optimized=True)
+
+    for cfg in model_configs:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings('error', category=RuntimeWarning)
+                warnings.filterwarnings('ignore', category=ConvergenceWarning)
+                with np.errstate(divide='raise', invalid='raise', over='raise'):
+                    model = ExponentialSmoothing(prices, **cfg)
+                    model_fit = _fit_holt_winters_with_bounds(model, cfg.get('seasonal') is not None)
+                    forecast = model_fit.forecast(steps)
+            forecast_arr = np.asarray(forecast, dtype=float)
+            forecast_arr = np.where(np.isfinite(forecast_arr), forecast_arr, prices[-1])
+            forecast_arr = np.maximum(forecast_arr, 1.0)
+            return np.floor(forecast_arr).astype(int).tolist()
+        except (RuntimeWarning, FloatingPointError, ValueError, ZeroDivisionError, LinAlgError):
+            continue
+        except Exception:
+            continue
+
+    # Final fallback: robust short-horizon forecast instead of hard failure.
+    fallback = robust_ewma(prices.tolist(), steps=steps, alpha=0.3, window=min(20, len(prices)), clip_sigma=1.5)
+    if fallback:
+        return [int(math.floor(float(v))) for v in fallback]
+    return [int(math.floor(float(prices[-1])))] * steps
 
 from functools import lru_cache
 
@@ -486,16 +594,34 @@ def cached_seasonality(series):
     return find_seasonality(np.array(series))
 
 
-def find_seasonality(y, min_period=2, max_period=60):
+def find_seasonality(y, min_period=6, max_period=60):
     from statsmodels.tsa.stattools import acf
     import numpy as np
 
-    y = np.asarray(y)
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
+
+    if len(y) == 0:
+        return None
+
+    # Constant/nearly-constant series can trigger invalid divisions in ACF internals.
+    if np.nanstd(y) < 1e-9:
+        return None
 
     if len(y) < max_period * 2:
         return None
 
-    acf_vals = acf(y, nlags=max_period, fft=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error', category=RuntimeWarning)
+            acf_vals = acf(y, nlags=max_period, fft=True)
+    except (RuntimeWarning, FloatingPointError, ValueError, ZeroDivisionError):
+        return None
+
+    acf_vals = np.asarray(acf_vals, dtype=float)
+    if acf_vals.size == 0:
+        return None
+    acf_vals = np.where(np.isfinite(acf_vals), acf_vals, -np.inf)
 
     # confidence threshold
     conf = 1.96 / np.sqrt(len(y))
@@ -506,7 +632,9 @@ def find_seasonality(y, min_period=2, max_period=60):
     if len(candidates) == 0:
         return None
 
-    return int(candidates[0])
+    candidate_scores = acf_vals[candidates]
+    best_idx = int(np.argmax(candidate_scores))
+    return int(candidates[best_idx])
 
 def sarimax_forecast(prices, steps=20):
     try:

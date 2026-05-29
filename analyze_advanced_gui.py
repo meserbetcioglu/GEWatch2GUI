@@ -5,7 +5,6 @@
 # - Descriptive status messages
 # - Filter template should use all filter fields
 
-print("[DEBUG] ===== GUI LOADED v2.1 WITH SELECTED_ROWS CALLBACK =====", flush=True)
 
 import dash
 from dash import dcc, html, dash_table
@@ -15,6 +14,7 @@ import json
 import os
 import sys
 import math
+import re
 import importlib
 from datetime import datetime, timedelta, timezone
 import time
@@ -34,7 +34,9 @@ from backend import (
     load_filter_template,
     list_filter_templates,
     delete_filter_template,
-    get_latest_prices
+    get_latest_prices,
+    get_5m_prices,
+    GE_TAX
 )
 from forecast_helpers import forecast_avg_price
 
@@ -46,13 +48,10 @@ def fetch_and_save_5m_data_safe(log_context=''):
         fetch_module = importlib.import_module('fetch_5m_data')
         fetch_and_save_5m_data = getattr(fetch_module, 'fetch_and_save_5m_data', None)
         if fetch_and_save_5m_data is None:
-            print(f"[DEBUG] fetch_5m_data module missing fetch_and_save_5m_data; skipping 5m refresh{context_suffix}.")
             return False
     except ModuleNotFoundError:
-        print(f"[DEBUG] fetch_5m_data module not found; skipping 5m refresh{context_suffix}.")
         return False
     except Exception as e:
-        print(f"[DEBUG] Could not import fetch_5m_data{context_suffix}: {e}")
         return False
 
     try:
@@ -61,6 +60,497 @@ def fetch_and_save_5m_data_safe(log_context=''):
     except Exception as e:
         print(f"Error fetching 5m data{context_suffix}: {e}")
         return False
+
+
+def _coerce_positive_float(value):
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric_value <= 0:
+        return None
+    return numeric_value
+
+
+def _normalize_dump_alert_metrics(metric_values):
+    allowed_metrics = {'avg_price', 'avg_low_price', 'avg_high_price', 'median_price'}
+    # RadioItems returns a single string; stored settings may still be a list
+    if isinstance(metric_values, str):
+        return [metric_values] if metric_values in allowed_metrics else ['avg_price']
+    if not metric_values:
+        return ['avg_price']
+    normalized = [m for m in metric_values if m in allowed_metrics]
+    return [normalized[0]] if normalized else ['avg_price']
+
+
+def _normalize_dump_alert_windows(window_values):
+    if isinstance(window_values, (int, float, str)):
+        window_values = [window_values]
+
+    if not window_values:
+        return [30]
+
+    normalized_windows = []
+    for value in window_values:
+        try:
+            window_minutes = int(value)
+        except (TypeError, ValueError):
+            continue
+        if window_minutes >= 5:
+            normalized_windows.append(window_minutes)
+
+    if not normalized_windows:
+        return [30]
+
+    return sorted(dict.fromkeys(normalized_windows))
+
+
+def _parse_dump_alert_custom_windows(custom_windows_text):
+    if not isinstance(custom_windows_text, str):
+        return []
+
+    tokens = [token.strip().lower() for token in re.split(r'[\s,;]+', custom_windows_text) if token.strip()]
+    parsed_windows = []
+    for token in tokens:
+        match = re.fullmatch(r'(\d+)([mhd]?)', token)
+        if not match:
+            continue
+
+        numeric_value = int(match.group(1))
+        unit = match.group(2) or 'm'
+        if numeric_value <= 0:
+            continue
+
+        if unit == 'h':
+            numeric_value *= 60
+        elif unit == 'd':
+            numeric_value *= 1440
+
+        parsed_windows.append(numeric_value)
+
+    return _normalize_dump_alert_windows(parsed_windows) if parsed_windows else []
+
+
+def _merged_dump_alert_windows(window_values, custom_windows_text):
+    if isinstance(window_values, (list, tuple, set)) and len(window_values) > 0:
+        preset_windows = _normalize_dump_alert_windows(window_values)
+    elif isinstance(window_values, (int, float, str)):
+        preset_windows = _normalize_dump_alert_windows([window_values])
+    else:
+        preset_windows = []
+
+    custom_windows = _parse_dump_alert_custom_windows(custom_windows_text)
+    if not custom_windows and not preset_windows:
+        return [30]
+    if not custom_windows:
+        return preset_windows
+    return _normalize_dump_alert_windows(preset_windows + custom_windows)
+
+
+def _extract_dump_alert_price(low_price, high_price, metric_key):
+    normalized_low = _coerce_positive_float(low_price)
+    normalized_high = _coerce_positive_float(high_price)
+
+    if metric_key == 'avg_low_price':
+        return normalized_low
+    if metric_key == 'avg_high_price':
+        return normalized_high
+
+    available_prices = [price for price in (normalized_low, normalized_high) if price is not None]
+    if not available_prices:
+        return None
+    if metric_key == 'median_price':
+        return float(np.median(available_prices))
+    if len(available_prices) == 1:
+        return available_prices[0]
+    return sum(available_prices) / len(available_prices)
+
+
+def _dump_alert_price_from_history_entry(entry, metric_key):
+    return _extract_dump_alert_price(entry.get('avgLowPrice'), entry.get('avgHighPrice'), metric_key)
+
+
+def _dump_alert_price_from_latest_entry(entry, metric_key):
+    return _extract_dump_alert_price(entry.get('low'), entry.get('high'), metric_key)
+
+
+def _dump_alert_current_price_from_latest_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    low_price = _coerce_positive_float(entry.get('low'))
+    high_price = _coerce_positive_float(entry.get('high'))
+    low_time = entry.get('lowTime')
+    high_time = entry.get('highTime')
+
+    if low_price is None and high_price is None:
+        return None
+    if low_price is None:
+        return high_price
+    if high_price is None:
+        return low_price
+
+    try:
+        low_time_value = float(low_time) if low_time is not None else None
+    except (TypeError, ValueError):
+        low_time_value = None
+    try:
+        high_time_value = float(high_time) if high_time is not None else None
+    except (TypeError, ValueError):
+        high_time_value = None
+
+    if low_time_value is not None and high_time_value is not None:
+        if low_time_value > high_time_value:
+            return low_price
+        if high_time_value > low_time_value:
+            return high_price
+
+    if high_time_value is not None and low_time_value is None:
+        return high_price
+    if low_time_value is not None and high_time_value is None:
+        return low_price
+
+    return high_price
+
+
+def _dump_alert_metric_label(metric_key):
+    metric_labels = {
+        'avg_price': 'Avg Price',
+        'avg_low_price': 'Avg of Low Prices',
+        'avg_high_price': 'Avg of High Prices',
+        'median_price': 'Median Price',
+    }
+    return metric_labels.get(metric_key, metric_key)
+
+
+def _dump_alert_chart_row_from_result(row):
+    if not isinstance(row, dict):
+        return None
+
+    item_id = str(row.get('item_id') or row.get('id') or '')
+    if not item_id:
+        return None
+
+    latest_low = row.get('latest_low')
+    latest_high = row.get('latest_high')
+    return {
+        'id': item_id,
+        'name': row.get('item_name') or f'Item {item_id}',
+        'lowP': latest_low,
+        'highP': latest_high,
+        'buy_price': latest_low,
+        'sell_price': latest_high,
+        'forecast_price': row.get('reference_price'),
+    }
+
+
+def _dump_alert_y_fit_range_from_lines(low_line, high_line, y_fit_pct=15):
+    low_value = _coerce_positive_float(low_line)
+    high_value = _coerce_positive_float(high_line)
+
+    if low_value is None or high_value is None:
+        return None
+
+    # Ensure correct order regardless of which price happens to be larger.
+    low_value, high_value = min(low_value, high_value), max(low_value, high_value)
+
+    try:
+        pct_value = float(y_fit_pct) if y_fit_pct is not None else 15.0
+    except (TypeError, ValueError):
+        pct_value = 15.0
+    pct_value = max(0.0, pct_value) / 100.0
+
+    lower_bound = low_value * (1 - pct_value)
+    upper_bound = high_value * (1 + pct_value)
+
+    if upper_bound <= lower_bound:
+        return None
+
+    return [lower_bound, upper_bound]
+
+
+def _dump_alert_chart_control_theme():
+    return {
+        'bgcolor': '#e5ecf6',
+        'activecolor': '#c7d7ef',
+        'bordercolor': '#b8c8df',
+        'borderwidth': 1,
+        'font_color': '#2a3f5f',
+        'font_size': 12,
+    }
+
+
+def _dump_alert_chart_button_style():
+    theme = _dump_alert_chart_control_theme()
+    return {
+        'height': '22px',
+        'padding': '0 8px',
+        'fontSize': '11px',
+        'lineHeight': '20px',
+        'border': f"1px solid {theme['bordercolor']}",
+        'borderRadius': '3px',
+        'backgroundColor': theme['bgcolor'],
+        'color': theme['font_color'],
+        'cursor': 'pointer',
+    }
+
+
+def _load_item_mapping_cache():
+    mapping_path = os.path.join(APP_DIR, 'Data', 'mapping_cache.json')
+    try:
+        with open(mapping_path, 'r', encoding='utf-8') as f:
+            mapping_json = json.load(f)
+    except Exception:
+        return {}
+
+    mapping = mapping_json.get('data', {})
+    return mapping if isinstance(mapping, dict) else {}
+
+
+def _format_utc_datetime_for_display(dt_value):
+    return dt_value.astimezone().strftime('%Y-%m-%d %H:%M')
+
+
+def _dump_alert_base_table_styles():
+    return [
+        {'if': {'row_index': 'odd'}, 'backgroundColor': '#f9f9f9'},
+        {'if': {'row_index': 'even'}, 'backgroundColor': 'white'},
+        {'if': {'filter_query': '{drop_pct} >= 10', 'column_id': 'drop_pct'}, 'color': '#c62828', 'fontWeight': 'bold'},
+        {'if': {'filter_query': '{drop_pct} >= 15'}, 'backgroundColor': '#fff1f1'},
+    ]
+
+
+def _default_dump_alert_settings():
+    return {
+        'threshold_pct': 5,
+        'min_gp_drop': 250,
+        'min_avg_daily_volume': 0,
+        'min_potential_profit': 0,
+        'min_volume_potential': 0,
+        'volume_power': 1,
+        'max_qty_factor': 1,
+        'metrics': ['avg_price'],
+        'windows': [30],
+        'custom_windows_text': '',
+        'alert_options': ['sound', 'highlight'],
+        'new_options': [],
+        'auto_refresh': ['enabled'],
+        'auto_refresh_minutes': 5,
+    }
+
+
+def _build_dump_alert_rows(threshold_pct, min_gp_drop, min_avg_daily_volume, min_potential_profit, min_volume_potential, volume_power, max_qty_factor, metric_values, window_values):
+    try:
+        threshold_pct = float(threshold_pct) if threshold_pct is not None else 5.0
+    except (TypeError, ValueError):
+        threshold_pct = 5.0
+    threshold_pct = max(0.1, threshold_pct)
+
+    try:
+        min_gp_drop = float(min_gp_drop) if min_gp_drop is not None else 0.0
+    except (TypeError, ValueError):
+        min_gp_drop = 0.0
+    min_gp_drop = max(0.0, min_gp_drop)
+
+    try:
+        min_avg_daily_volume = float(min_avg_daily_volume) if min_avg_daily_volume is not None else 0.0
+    except (TypeError, ValueError):
+        min_avg_daily_volume = 0.0
+    min_avg_daily_volume = max(0.0, min_avg_daily_volume)
+
+    try:
+        min_potential_profit = float(min_potential_profit) if min_potential_profit is not None else 0.0
+    except (TypeError, ValueError):
+        min_potential_profit = 0.0
+    min_potential_profit = max(0.0, min_potential_profit)
+
+    try:
+        min_volume_potential = float(min_volume_potential) if min_volume_potential is not None else 0.0
+    except (TypeError, ValueError):
+        min_volume_potential = 0.0
+    min_volume_potential = max(0.0, min_volume_potential)
+
+    try:
+        volume_power = float(volume_power) if volume_power is not None else 1.0
+    except (TypeError, ValueError):
+        volume_power = 1.0
+    volume_power = max(0.0, volume_power)
+
+    try:
+        max_qty_factor = float(max_qty_factor) if max_qty_factor is not None else 1.0
+    except (TypeError, ValueError):
+        max_qty_factor = 1.0
+    max_qty_factor = max(0.0, max_qty_factor)
+
+    metric_values = _normalize_dump_alert_metrics(metric_values)
+    window_values = _normalize_dump_alert_windows(window_values)
+
+    refreshed_5m = fetch_and_save_5m_data_safe('dump-alert')
+    five_m_prices = get_5m_prices()
+    latest_prices = get_latest_prices()
+    mapping = _load_item_mapping_cache()
+
+    rows = []
+    items_scanned = 0
+    for raw_item_id, history in five_m_prices.items():
+        if not history:
+            continue
+
+        item_id = str(raw_item_id)
+        item_info = mapping.get(item_id, {})
+        item_name = item_info.get('name') or f'Item {item_id}'
+        buy_limit = item_info.get('buy_limit') or item_info.get('limit') or ''
+        try:
+            buy_limit_numeric = int(float(buy_limit)) if buy_limit not in ('', None) else 0
+        except (TypeError, ValueError):
+            buy_limit_numeric = 0
+        latest_live_entry = latest_prices.get(item_id, {})
+
+        total_hist_vol = sum(
+            int(_coerce_positive_float(entry.get('lowPriceVolume')) or 0)
+            + int(_coerce_positive_float(entry.get('highPriceVolume')) or 0)
+            for entry in history
+        )
+        history_days = max(1.0, len(history) / (24.0 * 12.0))
+        avg_daily_volume = int(total_hist_vol / history_days) if total_hist_vol > 0 else 0
+
+        low_vol_recent = sum(int(_coerce_positive_float(entry.get('lowPriceVolume')) or 0) for entry in history[-6:])
+        high_vol_recent = sum(int(_coerce_positive_float(entry.get('highPriceVolume')) or 0) for entry in history[-6:])
+
+        for metric_key in metric_values:
+            valid_points = []
+            for entry in history:
+                raw_timestamp = entry.get('timestamp')
+                if not raw_timestamp:
+                    continue
+                try:
+                    entry_ts = datetime.strptime(raw_timestamp, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+
+                metric_price = _dump_alert_price_from_history_entry(entry, metric_key)
+                if metric_price is None:
+                    continue
+                valid_points.append((entry_ts, metric_price, entry))
+
+            if len(valid_points) < 2:
+                continue
+
+            valid_points.sort(key=lambda point: point[0])
+            latest_ts, latest_hist_price, latest_hist_entry = valid_points[-1]
+            current_price = _dump_alert_current_price_from_latest_entry(latest_live_entry)
+            if current_price is None:
+                current_price = _dump_alert_price_from_history_entry(latest_hist_entry, 'avg_price')
+
+            if current_price is None:
+                continue
+
+            items_scanned += 1
+
+            for window_minutes in window_values:
+                cutoff_ts = latest_ts - timedelta(minutes=window_minutes)
+                window_points = [point for point in valid_points if point[0] >= cutoff_ts]
+                if len(window_points) < 2:
+                    continue
+
+                window_metric_values = [point[1] for point in window_points if point[1] is not None]
+                if len(window_metric_values) < 2:
+                    continue
+
+                if metric_key == 'median_price':
+                    reference_price = float(np.median(window_metric_values))
+                    reference_seen = 'Window Median'
+                else:
+                    reference_price = float(np.mean(window_metric_values))
+                    reference_seen = 'Window Average'
+
+                current_metric_price = current_price
+
+                if reference_price is None or reference_price <= 0 or current_metric_price is None:
+                    continue
+
+                reference_price_int = int(round(reference_price))
+                current_metric_price_int = int(round(current_metric_price))
+                if reference_price_int <= 0:
+                    continue
+
+                gp_drop = reference_price_int - current_metric_price_int
+                drop_pct = (gp_drop / reference_price_int) * 100.0
+                if drop_pct < threshold_pct or gp_drop < min_gp_drop:
+                    continue
+
+                profit = 0
+                if current_metric_price_int > 0:
+                    taxed_sell_price = int(math.floor(reference_price_int * (1 - GE_TAX)))
+                    profit = taxed_sell_price - current_metric_price_int
+                if window_minutes < 60:
+                    max_qty = min(
+                        buy_limit_numeric,
+                        int(avg_daily_volume * 0.1 * (30 / 1440)) if avg_daily_volume > 0 else 0,
+                        low_vol_recent * 2 if low_vol_recent > 0 else 0,
+                    )
+                else:
+                    max_qty = min(
+                        buy_limit_numeric,
+                        int(avg_daily_volume * 0.6 * (window_minutes / 1440)) if avg_daily_volume > 0 else 0,
+                        low_vol_recent * 2 if low_vol_recent > 0 else 0,
+                    )
+
+                if window_minutes < 1440:
+                    max_qty = min(max_qty, int(avg_daily_volume * 0.05))
+
+                max_qty = max(0, int(max_qty))
+                max_qty = int(max_qty * max_qty_factor) if max_qty > 0 else 0
+                max_qty = min(max_qty, buy_limit_numeric)
+                potential_profit = profit * max_qty if profit > 0 else 0
+                volume_potential = (
+                    math.floor(math.log10(abs(potential_profit) * (avg_daily_volume ** volume_power)) * 100) / 100
+                    if avg_daily_volume > 0 and potential_profit is not None and abs(potential_profit) * (avg_daily_volume ** volume_power) > 1
+                    else 0
+                )
+
+                if avg_daily_volume < min_avg_daily_volume:
+                    continue
+                if potential_profit < min_potential_profit:
+                    continue
+                if volume_potential < min_volume_potential:
+                    continue
+
+                low_volume_window = sum(int(_coerce_positive_float(point[2].get('lowPriceVolume')) or 0) for point in window_points)
+                high_volume_window = sum(int(_coerce_positive_float(point[2].get('highPriceVolume')) or 0) for point in window_points)
+                latest_seen_ts = latest_ts
+                latest_low = latest_live_entry.get('low') if latest_live_entry else latest_hist_entry.get('avgLowPrice')
+                latest_high = latest_live_entry.get('high') if latest_live_entry else latest_hist_entry.get('avgHighPrice')
+                alert_key = f'{item_id}|{metric_key}|{window_minutes}'
+
+                rows.append({
+                    'alert_key': alert_key,
+                    'is_new': 0,
+                    'item_id': item_id,
+                    'item_name': item_name,
+                    'metric': _dump_alert_metric_label(metric_key),
+                    'metric_key': metric_key,
+                    'drop_pct': round(drop_pct, 2),
+                    'gp_drop': int(round(gp_drop)),
+                    'reference_price': reference_price_int,
+                    'current_price': current_metric_price_int,
+                    'window_minutes': window_minutes,
+                    'reference_seen': reference_seen,
+                    'latest_seen': _format_utc_datetime_for_display(latest_seen_ts),
+                    'latest_low': int(round(float(latest_low))) if latest_low is not None else '',
+                    'latest_high': int(round(float(latest_high))) if latest_high is not None else '',
+                    'window_low_volume': low_volume_window,
+                    'window_high_volume': high_volume_window,
+                    'avg_daily_volume': avg_daily_volume,
+                    'profit_per_item': profit,
+                    'buy_qty': max_qty,
+                    'potential_profit': int(round(potential_profit)),
+                    'volume_potential': round(volume_potential, 2),
+                    'buy_limit': buy_limit,
+                })
+
+    rows.sort(key=lambda row: (-row['drop_pct'], -row['gp_drop'], row['window_minutes'], row['item_name']))
+    return rows, items_scanned, refreshed_5m, threshold_pct, min_gp_drop, min_avg_daily_volume, min_potential_profit, min_volume_potential, volume_power, max_qty_factor, metric_values, window_values
 
 
 def evaluate_forecast_for_item(hist, forecast_horizon=60, train_ratio=0.8):
@@ -155,10 +645,14 @@ app.layout = html.Div([
     dcc.Tabs(id='main-tabs', value='analysis', children=[
         dcc.Tab(label='Analysis', value='analysis'),
         dcc.Tab(label='Watchlist', value='watchlist'),
+        dcc.Tab(label='Dump Alert', value='dump_alert'),
     ]),
     html.Div(id='tab-content'),
     dcc.Store(id='forecasted-prices-store'),
     dcc.Store(id='dark-mode-store', data={'dark_mode': False}),
+    dcc.Store(id='dump-alert-settings-store', storage_type='local', data=_default_dump_alert_settings()),
+    dcc.Store(id='dump-alert-refresh-state-store', data={'keys': [], 'sticky_new_keys': []}),
+    dcc.Store(id='dump-alert-sound-signal', data={'play': False, 'nonce': 0}),
 ], id='app-container', style={'minHeight': '100vh'})
 
 @app.callback(
@@ -197,6 +691,140 @@ def update_theme(store_data):
     return 'dark-mode' if dark_mode else ''
 
 
+@app.callback(
+    [
+        Output('dump-alert-threshold-pct', 'value'),
+        Output('dump-alert-min-gp-drop', 'value'),
+        Output('dump-alert-min-avg-daily-volume', 'value'),
+        Output('dump-alert-min-potential-profit', 'value'),
+        Output('dump-alert-min-volume-potential', 'value'),
+        Output('dump-alert-volume-power', 'value'),
+        Output('dump-alert-max-qty-factor', 'value'),
+        Output('dump-alert-metrics', 'value'),
+        Output('dump-alert-windows', 'value'),
+        Output('dump-alert-custom-windows', 'value'),
+        Output('dump-alert-options', 'value'),
+        Output('dump-alert-new-options', 'value'),
+        Output('dump-alert-auto-refresh', 'value'),
+        Output('dump-alert-auto-refresh-minutes', 'value'),
+    ],
+    Input('main-tabs', 'value'),
+    State('dump-alert-settings-store', 'data'),
+    prevent_initial_call=False
+)
+def load_dump_alert_settings(active_tab, settings_store):
+    if active_tab != 'dump_alert':
+        raise PreventUpdate
+
+    settings = _default_dump_alert_settings()
+    if isinstance(settings_store, dict):
+        settings.update(settings_store)
+
+    return (
+        settings.get('threshold_pct', 5),
+        settings.get('min_gp_drop', 250),
+        settings.get('min_avg_daily_volume', 0),
+        settings.get('min_potential_profit', 0),
+        settings.get('min_volume_potential', 0),
+        settings.get('volume_power', 1),
+        settings.get('max_qty_factor', 1),
+        _normalize_dump_alert_metrics(settings.get('metrics'))[0],
+        _normalize_dump_alert_windows(settings.get('windows')),
+        settings.get('custom_windows_text', ''),
+        settings.get('alert_options', ['sound', 'highlight']) or [],
+        settings.get('new_options', []) or [],
+        settings.get('auto_refresh', ['enabled']) or [],
+        settings.get('auto_refresh_minutes', 5),
+    )
+
+
+@app.callback(
+    Output('dump-alert-settings-store', 'data'),
+    [
+        Input('dump-alert-threshold-pct', 'value'),
+        Input('dump-alert-min-gp-drop', 'value'),
+        Input('dump-alert-min-avg-daily-volume', 'value'),
+        Input('dump-alert-min-potential-profit', 'value'),
+        Input('dump-alert-min-volume-potential', 'value'),
+        Input('dump-alert-volume-power', 'value'),
+        Input('dump-alert-max-qty-factor', 'value'),
+        Input('dump-alert-metrics', 'value'),
+        Input('dump-alert-windows', 'value'),
+        Input('dump-alert-custom-windows', 'value'),
+        Input('dump-alert-options', 'value'),
+        Input('dump-alert-new-options', 'value'),
+        Input('dump-alert-auto-refresh', 'value'),
+        Input('dump-alert-auto-refresh-minutes', 'value'),
+    ],
+    prevent_initial_call=True
+)
+def persist_dump_alert_settings(threshold_pct, min_gp_drop, min_avg_daily_volume, min_potential_profit, min_volume_potential, volume_power, max_qty_factor, metric_values, window_values, custom_windows_text, alert_options, new_options, auto_refresh_value, auto_refresh_minutes):
+    defaults = _default_dump_alert_settings()
+    try:
+        threshold_pct = float(threshold_pct) if threshold_pct is not None else defaults['threshold_pct']
+    except (TypeError, ValueError):
+        threshold_pct = defaults['threshold_pct']
+    try:
+        min_gp_drop = float(min_gp_drop) if min_gp_drop is not None else defaults['min_gp_drop']
+    except (TypeError, ValueError):
+        min_gp_drop = defaults['min_gp_drop']
+    try:
+        min_avg_daily_volume = float(min_avg_daily_volume) if min_avg_daily_volume is not None else defaults['min_avg_daily_volume']
+    except (TypeError, ValueError):
+        min_avg_daily_volume = defaults['min_avg_daily_volume']
+    try:
+        min_potential_profit = float(min_potential_profit) if min_potential_profit is not None else defaults['min_potential_profit']
+    except (TypeError, ValueError):
+        min_potential_profit = defaults['min_potential_profit']
+    try:
+        min_volume_potential = float(min_volume_potential) if min_volume_potential is not None else defaults['min_volume_potential']
+    except (TypeError, ValueError):
+        min_volume_potential = defaults['min_volume_potential']
+    try:
+        volume_power = float(volume_power) if volume_power is not None else defaults['volume_power']
+    except (TypeError, ValueError):
+        volume_power = defaults['volume_power']
+    try:
+        max_qty_factor = float(max_qty_factor) if max_qty_factor is not None else defaults['max_qty_factor']
+    except (TypeError, ValueError):
+        max_qty_factor = defaults['max_qty_factor']
+    try:
+        auto_refresh_minutes = int(float(auto_refresh_minutes)) if auto_refresh_minutes is not None else defaults['auto_refresh_minutes']
+    except (TypeError, ValueError):
+        auto_refresh_minutes = defaults['auto_refresh_minutes']
+
+    return {
+        'threshold_pct': max(0.1, threshold_pct),
+        'min_gp_drop': max(0.0, min_gp_drop),
+        'min_avg_daily_volume': max(0.0, min_avg_daily_volume),
+        'min_potential_profit': max(0.0, min_potential_profit),
+        'min_volume_potential': max(0.0, min_volume_potential),
+        'volume_power': max(0.0, volume_power),
+        'max_qty_factor': max(0.0, max_qty_factor),
+        'metrics': _normalize_dump_alert_metrics(metric_values),
+        'windows': _normalize_dump_alert_windows(window_values),
+        'custom_windows_text': custom_windows_text or '',
+        'alert_options': alert_options or [],
+        'new_options': new_options or [],
+        'auto_refresh': auto_refresh_value or [],
+        'auto_refresh_minutes': min(1440, max(1, auto_refresh_minutes)),
+    }
+
+
+@app.callback(
+    [Output('dump-alert-interval', 'disabled'), Output('dump-alert-interval', 'interval')],
+    [Input('dump-alert-auto-refresh', 'value'), Input('dump-alert-auto-refresh-minutes', 'value')],
+    prevent_initial_call=False
+)
+def toggle_dump_alert_auto_refresh(auto_refresh_value, auto_refresh_minutes):
+    try:
+        refresh_minutes = int(float(auto_refresh_minutes)) if auto_refresh_minutes is not None else 5
+    except (TypeError, ValueError):
+        refresh_minutes = 5
+    refresh_minutes = min(1440, max(1, refresh_minutes))
+    return 'enabled' not in (auto_refresh_value or []), refresh_minutes * 60 * 1000
+
+
 
 
 
@@ -209,9 +837,14 @@ def update_theme(store_data):
 # --- Tab content callback ---
 @app.callback(
     Output('tab-content', 'children'),
-    Input('main-tabs', 'value')
+    Input('main-tabs', 'value'),
+    State('dump-alert-settings-store', 'data')
 )
-def render_tab_content(tab):
+def render_tab_content(tab, dump_alert_settings_store):
+    dump_alert_settings = _default_dump_alert_settings()
+    if isinstance(dump_alert_settings_store, dict):
+        dump_alert_settings.update(dump_alert_settings_store)
+
     if tab == 'analysis':
         # Render the original analysis layout
         return html.Div([
@@ -301,6 +934,7 @@ def render_tab_content(tab):
                                 # {'label': 'Median Trend (Stable)', 'value': 'median_trend'},
                                 {'label': 'Median Reversion (Weekly Bias)', 'value': 'median_reversion_weekly'},
                                 {'label': 'Long-Range Stable Forecast', 'value': 'long_range'},
+                                {'label': 'Volume Percentile Median (Top 15%)', 'value': 'volume_percentile_median'},
 
                                 # ---- RECOMMENDED DEFAULT ----
                                 {'label': 'Auto (Horizon-Aware Mix)', 'value': 'mix'},
@@ -319,7 +953,7 @@ def render_tab_content(tab):
                         dcc.Input(id='max-price', type='number', value=0, debounce=True, style={'width': '70px', 'marginRight': '30px'}),
                         html.Label('Min Daily Volume', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='min-avg-daily-volume', type='number', value=0, debounce=True, style={'width': '90px', 'marginRight': '30px'}),
-                        html.Label('Max Time to Fill (min)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
+                        html.Label('Avg Trade Recency (min)', style={'display': 'flex', 'align-items': 'center', 'line-height': 'normal', 'marginRight': '10px'}),
                         dcc.Input(id='max-avg-trade-time', type='number', value=0, debounce=True, style={'width': '120px', 'marginRight': '30px'}),
                     ], className='filter-row', style={'display': 'flex', 'width': 'auto', 'marginBottom': '12px'}),
                     html.Div([
@@ -513,6 +1147,10 @@ def render_tab_content(tab):
                         )
                     ]
                 ),
+                html.Div([
+                    html.Button('Y Fit', id='chart-y-fit-btn', n_clicks=0, style=_dump_alert_chart_button_style()),
+                    dcc.Input(id='chart-y-fit-pct', type='number', value=15, min=0, step=1, debounce=True, style={'width': '70px', 'marginLeft': '8px'}),
+                ], style={'marginTop': '10px'}),
                 html.Div(id='timeseries-container', style={'marginTop': '30px'}),
             ]),
         ], className='tab-page')
@@ -575,6 +1213,189 @@ def render_tab_content(tab):
                 selected_rows=[],
                 editable=True,
             )
+        ], className='tab-page')
+
+    elif tab == 'dump_alert':
+        return html.Div([
+            html.H2('Dump Alert'),
+            html.P('Flags items whose 5-minute price has fallen sharply from the peak seen inside your selected time window.'),
+            html.Div([
+                html.Div([
+                    html.Label('Drop Threshold (%)'),
+                    dcc.Input(id='dump-alert-threshold-pct', type='number', value=dump_alert_settings.get('threshold_pct', 5), min=0.1, step=0.5, style={'width': '120px'})
+                ], className='filter-field'),
+                html.Div([
+                    html.Label('Min GP Drop'),
+                    dcc.Input(id='dump-alert-min-gp-drop', type='number', value=dump_alert_settings.get('min_gp_drop', 250), min=0, step=50, style={'width': '120px'})
+                ], className='filter-field'),
+                html.Div([
+                    html.Label('Min Avg Daily Volume'),
+                    dcc.Input(id='dump-alert-min-avg-daily-volume', type='number', value=dump_alert_settings.get('min_avg_daily_volume', 0), min=0, step=1, style={'width': '150px'})
+                ], className='filter-field'),
+                html.Div([
+                    html.Label('Min Potential Profit (gp)'),
+                    dcc.Input(id='dump-alert-min-potential-profit', type='number', value=dump_alert_settings.get('min_potential_profit', 0), min=0, step=1, style={'width': '150px'})
+                ], className='filter-field'),
+                html.Div([
+                    html.Label('Min Volume Potential'),
+                    dcc.Input(id='dump-alert-min-volume-potential', type='number', value=dump_alert_settings.get('min_volume_potential', 0), min=0, step=0.1, style={'width': '150px'})
+                ], className='filter-field'),
+                html.Div([
+                    html.Label('Volume Weight'),
+                    dcc.Input(id='dump-alert-volume-power', type='number', value=dump_alert_settings.get('volume_power', 1), min=0, step=0.1, style={'width': '120px'})
+                ], className='filter-field'),
+                html.Div([
+                    html.Label('Amount Multiplier'),
+                    dcc.Input(id='dump-alert-max-qty-factor', type='number', value=dump_alert_settings.get('max_qty_factor', 1), min=0, step=0.1, style={'width': '130px'})
+                ], className='filter-field'),
+                html.Button('Refresh Now', id='dump-alert-refresh-btn', n_clicks=0, style={'height': '38px'}),
+            ], className='filter-row', style={'marginBottom': '16px'}),
+            html.Div([
+                html.Div([
+                    html.Label('Drop Metric'),
+                    dcc.RadioItems(
+                        id='dump-alert-metrics',
+                        options=[
+                            {'label': 'Avg', 'value': 'avg_price'},
+                            {'label': 'Avg of Low Prices', 'value': 'avg_low_price'},
+                            {'label': 'Avg of High Prices', 'value': 'avg_high_price'},
+                            {'label': 'Median Price', 'value': 'median_price'},
+                        ],
+                        value=_normalize_dump_alert_metrics(dump_alert_settings.get('metrics'))[0],
+                        inline=True,
+                    ),
+                ], className='filter-field', style={'alignItems': 'flex-start'}),
+            ], className='filter-row', style={'marginBottom': '10px'}),
+            html.Div([
+                html.Div([
+                    html.Label('Tracked Windows'),
+                    dcc.Checklist(
+                        id='dump-alert-windows',
+                        options=[
+                            {'label': '15m', 'value': 15},
+                            {'label': '30m', 'value': 30},
+                            {'label': '60m', 'value': 60},
+                            {'label': '120m', 'value': 120},
+                            {'label': '240m', 'value': 240},
+                            {'label': '360m (6h)', 'value': 360},
+                            {'label': '720m (12h)', 'value': 720},
+                            {'label': '1440m (1d)', 'value': 1440},
+                            {'label': '2880m (2d)', 'value': 2880},
+                            {'label': '10080m (7d)', 'value': 10080},
+                        ],
+                        value=_normalize_dump_alert_windows(dump_alert_settings.get('windows')),
+                        inline=True,
+                    ),
+                    dcc.Input(
+                        id='dump-alert-custom-windows',
+                        type='text',
+                        value=dump_alert_settings.get('custom_windows_text', ''),
+                        placeholder='Custom windows (e.g. 360, 12h, 2d)',
+                        debounce=True,
+                        style={'width': '280px', 'marginTop': '8px'}
+                    ),
+                ], className='filter-field', style={'alignItems': 'flex-start'}),
+                html.Div([
+                    html.Label('Alert Options'),
+                    dcc.Checklist(
+                        id='dump-alert-options',
+                        options=[
+                            {'label': 'Play sound for new alerts', 'value': 'sound'},
+                            {'label': 'Highlight new alerts', 'value': 'highlight'},
+                        ],
+                        value=dump_alert_settings.get('alert_options', ['sound', 'highlight']) or [],
+                        inline=True,
+                    ),
+                ], className='filter-field', style={'alignItems': 'flex-start'}),
+            ], className='filter-row', style={'marginBottom': '16px'}),
+            html.Div([
+                html.Div([
+                    html.Label('New Alert Options'),
+                    dcc.Checklist(
+                        id='dump-alert-new-options',
+                        options=[
+                            {'label': 'Show only new since last refresh', 'value': 'show_new_only'},
+                            {'label': 'Keep new markers until manual refresh', 'value': 'sticky_new'},
+                        ],
+                        value=dump_alert_settings.get('new_options', []) or [],
+                        inline=True,
+                    ),
+                ], className='filter-field', style={'alignItems': 'flex-start'}),
+                html.Div([
+                    html.Label('Refresh Mode'),
+                    dcc.Checklist(
+                        id='dump-alert-auto-refresh',
+                        options=[
+                            {'label': 'Enable auto-refresh', 'value': 'enabled'},
+                        ],
+                        value=dump_alert_settings.get('auto_refresh', ['enabled']) or [],
+                        inline=True,
+                    ),
+                    html.Div([
+                        html.Label('Every (min)', style={'marginRight': '8px'}),
+                        dcc.Input(
+                            id='dump-alert-auto-refresh-minutes',
+                            type='number',
+                            value=dump_alert_settings.get('auto_refresh_minutes', 5),
+                            min=1,
+                            max=1440,
+                            step=1,
+                            debounce=True,
+                            style={'width': '80px'}
+                        ),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '8px'}),
+                ], className='filter-field', style={'alignItems': 'flex-start'}),
+            ], className='filter-row', style={'marginBottom': '14px'}),
+            dcc.Interval(id='dump-alert-interval', interval=5 * 60 * 1000, n_intervals=0),
+            html.Div(id='dump-alert-sound-dummy', style={'display': 'none'}),
+            html.Div(id='dump-alert-formula-help', style={'marginBottom': '8px', 'fontSize': '13px', 'opacity': 0.85}),
+            html.Div(id='dump-alert-status', style={'marginBottom': '6px', 'fontWeight': 'bold'}),
+            html.Div(id='dump-alert-new-summary', style={'marginBottom': '8px', 'fontSize': '14px', 'color': '#8a5a00'}),
+            html.Div(id='dump-alert-last-refresh', style={'marginBottom': '14px', 'fontSize': '14px', 'opacity': 0.85}),
+            dash_table.DataTable(
+                id='dump-alert-table',
+                columns=[
+                    {'name': 'Alert Key', 'id': 'alert_key', 'type': 'text'},
+                    {'name': 'Is New', 'id': 'is_new', 'type': 'numeric'},
+                    {'name': 'Item ID', 'id': 'item_id', 'type': 'text'},
+                    {'name': 'Item Name', 'id': 'item_name', 'type': 'text'},
+                    {'name': 'Metric', 'id': 'metric', 'type': 'text'},
+                    {'name': 'Drop %', 'id': 'drop_pct', 'type': 'numeric'},
+                    {'name': 'GP Drop', 'id': 'gp_drop', 'type': 'numeric'},
+                    {'name': 'Reference Price', 'id': 'reference_price', 'type': 'numeric'},
+                    {'name': 'Current Price', 'id': 'current_price', 'type': 'numeric'},
+                    {'name': 'Window (m)', 'id': 'window_minutes', 'type': 'numeric'},
+                    {'name': 'Reference Seen', 'id': 'reference_seen', 'type': 'text'},
+                    {'name': 'Latest Seen', 'id': 'latest_seen', 'type': 'text'},
+                    {'name': 'Latest Low', 'id': 'latest_low', 'type': 'numeric'},
+                    {'name': 'Latest High', 'id': 'latest_high', 'type': 'numeric'},
+                    {'name': 'Low Vol (Window)', 'id': 'window_low_volume', 'type': 'numeric'},
+                    {'name': 'High Vol (Window)', 'id': 'window_high_volume', 'type': 'numeric'},
+                    {'name': 'Avg Daily Volume', 'id': 'avg_daily_volume', 'type': 'numeric'},
+                    {'name': 'Profit/Item', 'id': 'profit_per_item', 'type': 'numeric'},
+                    {'name': 'Buy Qty', 'id': 'buy_qty', 'type': 'numeric'},
+                    {'name': 'Potential Profit', 'id': 'potential_profit', 'type': 'numeric'},
+                    {'name': 'Volume Potential', 'id': 'volume_potential', 'type': 'numeric'},
+                    {'name': 'Buy Limit', 'id': 'buy_limit', 'type': 'numeric'},
+                ],
+                data=[],
+                hidden_columns=['alert_key', 'is_new'],
+                page_size=25,
+                sort_action='native',
+                style_table={'overflowX': 'auto'},
+                style_cell={'textAlign': 'center', 'fontSize': '11px', 'padding': '0px 6px', 'height': '20px', 'maxHeight': '20px', 'minHeight': '0px', 'lineHeight': '20px'},
+                style_header={'fontWeight': 'bold', 'fontSize': '11px', 'padding': '0px 6px', 'height': '20px', 'maxHeight': '20px', 'minHeight': '0px', 'lineHeight': '20px'},
+                style_cell_conditional=[
+                    {'if': {'column_id': 'item_name'}, 'textAlign': 'left', 'minWidth': '180px', 'width': '180px', 'maxWidth': '240px'},
+                    {'if': {'column_id': 'metric'}, 'minWidth': '110px', 'width': '110px', 'maxWidth': '140px'},
+                ],
+                style_data_conditional=_dump_alert_base_table_styles(),
+            ),
+            html.Div([
+                html.Button('Y Fit', id='dump-alert-chart-y-fit-btn', n_clicks=0, style=_dump_alert_chart_button_style()),
+                dcc.Input(id='dump-alert-chart-y-fit-pct', type='number', value=15, min=0, step=1, debounce=True, style={'width': '70px', 'marginLeft': '8px'}),
+            ], style={'marginTop': '10px'}),
+            html.Div(id='dump-alert-timeseries-container', style={'marginTop': '30px'}),
         ], className='tab-page')
 
 
@@ -708,32 +1529,20 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
     if forecast_sell_time is None:
         forecast_sell_time = 0
     
-    print('[DEBUG] update_table_and_times callback called')
     t_debug_start = time.time()
     ctx = dash.callback_context
     triggered = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
-    print(f'[DEBUG] triggered: {triggered}')
-    print(f'[DEBUG] Start of callback, time: {t_debug_start}')
     # Forecast table cell-click watchlist logic is handled by dedicated watchlist callbacks.
     # Ensure filter_by_watchlist_input is always a list
-    print('[DEBUG] Before filter_by_watchlist_input normalization, time:', time.time() - t_debug_start)
     if filter_by_watchlist_input is None:
         filter_by_watchlist_input = []
-    print(f'[DEBUG] filter_by_watchlist_input (normalized): {filter_by_watchlist_input}')
-    print('[DEBUG] After filter_by_watchlist_input normalization, time:', time.time() - t_debug_start)
     # import time module already at top, avoid shadowing
     t0 = time.time()
-    print(f'[DEBUG] update_table_and_times called! n_clicks={n_clicks}')
-    print(f'[DEBUG] filter params: item_name_search={item_name_search}, forecast_strategy={forecast_strategy}, min_profit={min_profit}, min_potential_profit={min_potential_profit}, min_volume={min_volume}, min_roi={min_roi}, forecast_hours={forecast_hours}, forecast_recency_minutes={forecast_recency_minutes}, top_n={top_n}, sort_attribute={sort_attribute}, trend_filter={trend_filter}, forecast_sell_time={forecast_sell_time}, min_price={min_price}, max_price={max_price}, min_avg_daily_volume={min_avg_daily_volume}')
-    print('[DEBUG] After filter param print, time:', time.time() - t_debug_start)
     t1 = time.time()
-    print(f'[DEBUG] Time after param print: {t1-t0:.3f}s')
     forecast_start = time.time()
-    print('[DEBUG] Before main callback logic, time:', time.time() - t_debug_start)
 
 
     # If item-name-search or watchlist filter is triggered, apply those filters
-    print('[DEBUG] Before item-name-search/watchlist branch, time:', time.time() - t_debug_start)
     if 'item-name-search' in triggered or 'filter-by-watchlist' in triggered or (item_name_search and isinstance(item_name_search, str) and item_name_search.strip()) or (filter_by_watchlist_input and 'watchlist' in filter_by_watchlist_input):
         
         search_term = (item_name_search or '').strip().lower()
@@ -744,8 +1553,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         #     return table_data, no_update, no_update, no_update
         
         t2 = time.time()
-        print(f'[DEBUG] Entered item-name-search/watchlist branch: {t2-t1:.3f}s')
-        print('[DEBUG] Before 5m data check/fetch, time:', time.time() - t_debug_start)
         # Only fetch new 5m data if latest chunk is missing
         import os, json, datetime
         FIVE_M_FILE = os.path.join(APP_DIR, 'Data', '5m_data_cache.json')
@@ -761,8 +1568,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                     pass
         now = datetime.datetime.now(datetime.timezone.utc)
         expected_latest_ts = ((now.replace(second=0, microsecond=0) - datetime.timedelta(minutes=now.minute % 5)).strftime('%Y-%m-%dT%H:%M:%S'))
-        print('[DEBUG] Checking/fetching 5m data...')
-        print('[DEBUG] Before analyze_forecast_gui call, time:', time.time() - t_debug_start)
         # Only fetch if latest chunk is older than 10 minutes
         fetch_needed = True
         # if latest_ts is None:
@@ -779,12 +1584,10 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         if fetch_needed:
             try:
                 if fetch_and_save_5m_data_safe('item-name/watchlist'):
-                    print('[DEBUG] 5m data check/fetch complete.')
+                    pass
             except Exception as e:
                 print(f"Error fetching 5m data: {e}")
         t2b = time.time()
-        print(f'[DEBUG] 5m data update duration: {t2b-t2:.3f}s')
-        print('[DEBUG] Preparing historical data for forecast...')
         hist_data_source = 'Price_History.json'
         hist = None
         if forecast_sell_time is not None and forecast_sell_time <= 180:
@@ -812,10 +1615,7 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                         item_hist_map[item_id].append(entry_copy)
                 hist = item_hist_map
             except Exception as e:
-                print(f'[DEBUG] Error loading 5m_data_cache.json: {e}')
-        print('[DEBUG] Calling analyze_forecast_gui...')
-        print('[DEBUG] Before analyze_forecast_gui actual call, time:', time.time() - t_debug_start)
-        print('[DEBUG] About to call analyze_forecast_gui, time:', time.time() - t_debug_start)
+                pass
 
         import os, json
         
@@ -825,23 +1625,16 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         # --- Watchlist filter logic ---
         watchlist_ids = set()
         watchlist_filter_active = filter_by_watchlist_input and 'watchlist' in filter_by_watchlist_input
-        print(f'[DEBUG] filter_by_watchlist_input: {filter_by_watchlist_input}')
         if watchlist_filter_active:
             watchlist_path = os.path.join(APP_DIR, 'Data', 'watchlist.json')
             try:
                 with open(watchlist_path, 'r', encoding='utf-8') as f:
                     watchlist = json.load(f)
-                print(f'[DEBUG] Loaded watchlist: {watchlist}')
                 watchlist_ids = set(str(w['item_id']) for w in watchlist if 'item_id' in w)
-                print(f'[DEBUG] Extracted watchlist_ids: {watchlist_ids}')
             except Exception as e:
-                print(f'[DEBUG] Error loading watchlist: {e}')
                 watchlist_ids = set()
-            print(f'[DEBUG] Watchlist filter active. Watchlist IDs: {watchlist_ids}')
-        print(f'[DEBUG] Filtering by name ("{search_term}") and/or watchlist ({watchlist_filter_active})...')
         if watchlist_filter_active:
             if not watchlist_ids:
-                print('[DEBUG] No watchlist IDs found, filtered will be empty.')
                 name_filter = []
             else:
                 # a = mapping_cache
@@ -875,14 +1668,11 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             if gui_status_filter and len(gui_status_filter) > 0:
                 status_filter_ctx = gui_status_filter
                 status_filter_mode = 'exclude' if 'exclude' in ctx_local.inputs.get('status-filter-exclude.value', []) else 'include'
-                print(f'[DEBUG-GUI] Using GUI status filter: {status_filter_ctx}, mode: {status_filter_mode}')
             else:
-                print(f'[DEBUG-GUI] No status filter selected in UI')
+                pass
 
-        print(f'[DEBUG-GUI] Final status filter to send: {status_filter_ctx}, exclude: {status_exclude_ctx}, mode: {status_filter_mode}')
         
         try:
-            print('[DEBUG] Entering analyze_forecast_gui...')
             all_items, forecasted_prices, latest_prices = analyze_forecast_gui({
                 'MIN_FORECAST_PROFIT': 0,
                 'MIN_POTENTIAL_PROFIT': 0,
@@ -894,28 +1684,19 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                 'STATUS_FILTER_MODE': status_filter_mode,
                 'STATUS_EXCLUDE': status_exclude_ctx,
             }, forecast_sell_time, forecast_strategy, name_filter=name_filter, volume_power = volume_power, max_qty_factor=max_qty_factor, forecast_hours=forecast_hours, buy_price_type=buy_price_type, forecast_price_type=forecast_price_type)
-            print('[DEBUG] analyze_forecast_gui finished, time:', time.time() - t_debug_start)
         except Exception as e:
-            print(f'[DEBUG] Exception in analyze_forecast_gui: {e}')
             all_items, forecasted_prices = [], []
-        print('[DEBUG] After analyze_forecast_gui execution, time:', time.time() - t_debug_start)
         forecast_end = time.time()
         forecast_duration = forecast_end - forecast_start
-        print('[DEBUG] After analyze_forecast_gui returned, time:', time.time() - t_debug_start)
         
         t4 = time.time()
         data = all_items
-        print('[DEBUG] Before apply-filters branch, time:', time.time() - t_debug_start)
     elif 'apply-filters' in triggered:
         t2 = time.time()
-        print(f'[DEBUG] Entered apply-filters branch: {t2-t1:.3f}s')
-        print('[DEBUG] Before 5m data check/fetch (apply-filters), time:', time.time() - t_debug_start)
         # Always fetch new 5m data on update
-        print('[DEBUG] Checking/fetching 5m data...')
-        print('[DEBUG] Before analyze_forecast_gui call (apply-filters), time:', time.time() - t_debug_start)
         try:
             if fetch_and_save_5m_data_safe('apply-filters'):
-                print('[DEBUG] 5m data check/fetch complete.')
+                pass
         except Exception as e:
             print(f"Error fetching 5m data: {e}")
         t2b = time.time()
@@ -928,15 +1709,9 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             mapping_cache = json.load(f)
         if item_name_search and isinstance(item_name_search, str) and item_name_search.strip():
             search_term = item_name_search.strip().lower()
-            print(f"[DEBUG] Performing item name search: '{search_term}' (disregarding all filters)")
-            print('[DEBUG] Filtering by name...')
             name_filter = [mapping_cache['data'][r]['name'] for r in mapping_cache['data'] if not search_term or search_term in r['name'].lower()]
 
 
-        print(f'[DEBUG] 5m data update duration: {t2b-t2:.3f}s')
-        print('[DEBUG] Calling analyze_forecast_gui...')
-        print('[DEBUG] Before analyze_forecast_gui actual call (apply-filters), time:', time.time() - t_debug_start)
-        print('[DEBUG] Before analyze_forecast_gui execution (apply-filters), time:', time.time() - t_debug_start)
 
         # Gather status filter from GUI dropdown parameter
         status_filter_ctx = []
@@ -947,11 +1722,9 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         if status_filter and isinstance(status_filter, list) and len(status_filter) > 0:
             status_filter_ctx = status_filter
             # Check if exclude mode is enabled (you'd need to add this as a State too if needed)
-            print(f'[DEBUG-GUI] (apply-filters) Using GUI status filter: {status_filter_ctx}, mode: {status_filter_mode}')
         else:
-            print(f'[DEBUG-GUI] (apply-filters) No status filter selected in UI')
+            pass
 
-        print(f'[DEBUG-GUI] (apply-filters) Final status filter to send: {status_filter_ctx}, exclude: {status_exclude_ctx}, mode: {status_filter_mode}')
 
         # Send no status filter to backend; apply UI status filter on the GUI-rendered rows
         all_items, forecasted_prices_raw, latest_prices = analyze_forecast_gui({
@@ -965,18 +1738,15 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             'STATUS_FILTER_MODE': 'include',
             'STATUS_EXCLUDE': [],
         }, forecast_sell_time, forecast_strategy, name_filter=name_filter, max_avg_trade_time=max_avg_trade_time, volume_power = volume_power, max_qty_factor=max_qty_factor, forecast_hours=forecast_hours, buy_price_type=buy_price_type, forecast_price_type=forecast_price_type)
-        print('[DEBUG] After analyze_forecast_gui execution (apply-filters), time:', time.time() - t_debug_start)
         forecast_end = time.time()
         forecast_duration = forecast_end - forecast_start
         t3 = time.time()
-        print('[DEBUG] After analyze_forecast_gui returned (apply-filters), time:', time.time() - t_debug_start)
         # Build forecasted_prices map by id
         forecasted_prices_map = {entry['id']: entry for entry in forecasted_prices_raw if 'id' in entry}
         # If item name search is provided, filter by name and disregard all other filters
         if item_name_search and isinstance(item_name_search, str) and item_name_search.strip():
             pass
         else:
-            print('[DEBUG] Filtering by all filters...')
             t4 = time.time()
             filtered = [r for r in all_items
                         if (min_potential_profit is None or min_potential_profit == 0 or (r.get('potential_profit', 0) >= min_potential_profit))
@@ -988,7 +1758,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                         and (max_price is None or max_price == 0 or (r.get('lowP', 0) <= max_price))
                         and (min_avg_daily_volume is None or min_avg_daily_volume == 0 or (r.get('avg_daily_volume', 0) >= min_avg_daily_volume))]
             t5 = time.time()
-            print(f'[DEBUG] After filter: {t5-t4:.3f}s, filtered={len(filtered)}')
             # Sorting logic
             if isinstance(filtered, list) and filtered and sort_attribute:
                 if all(isinstance(x, dict) for x in filtered):
@@ -1003,9 +1772,8 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                                 return float('-inf')
                         filtered.sort(key=safe_sort_key, reverse=True)
                         t5b = time.time()
-                        print(f'[DEBUG] After sort: {t5b-t5:.3f}s, filtered={len(filtered)}')
                     except Exception as e:
-                        print(f'[DEBUG] Error sorting by {sort_attribute}: {e}')
+                            pass
             forecasted_prices = [forecasted_prices_map[item['id']] for item in filtered if item['id'] in forecasted_prices_map]
             # Validate forecast_price structure
             for fp in forecasted_prices:
@@ -1014,7 +1782,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             # Defer top_n slicing until after UI status filtering on rendered rows
             data = filtered
             t6 = time.time()
-            print(f'[DEBUG] After top_n: {t6-t5:.3f}s, data={len(data)}')
 
 
             HARD_CAP = 100
@@ -1038,8 +1805,7 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                 else:
                     data = data[:HARD_CAP]
                 if len(data) == HARD_CAP:
-                    print(f'[DEBUG] Table row count capped at {HARD_CAP}')
-                print(f'[DEBUG] Final data row count: {len(data)}')
+                    pass
 
     if not isinstance(data, list):
         # Defensive: if data is not a list, return empty table and log error
@@ -1133,7 +1899,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         # --- Filter by status column using the State parameter ---
         status_filter_values = status_filter if isinstance(status_filter, list) else []
         if status_filter_values:
-            print(f"[DEBUG-GUI] Applying UI status filter on rendered rows: {status_filter_values}")
             def _matches_status(row_status: str, selected_terms: list) -> bool:
                 s = (row_status or '').strip()
                 s_lower = s.lower()
@@ -1151,7 +1916,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         
         # --- Filter by risk level ---
         if risk_filter and risk_filter != 'all':
-            print(f"[DEBUG-GUI] Applying risk filter: {risk_filter}")
             if risk_filter == 'low':
                 data = [row for row in data if row.get('risk_level') == 'Low Risk']
             elif risk_filter == 'low_medium':
@@ -1164,8 +1928,7 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         else:
             data = data[:HARD_CAP]
         if len(data) == HARD_CAP:
-            print(f'[DEBUG] Table row count capped at {HARD_CAP}')
-        print(f'[DEBUG] Final data row count: {len(data)}')
+            pass
 
     # Provide all_statuses for use in the status filter dropdown elsewhere (e.g., as a return value or via a store)
 
@@ -1213,7 +1976,11 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             
             # If backend set a custom lowP (like 30min avg), keep it; otherwise use API value
             new_row['lowP'] = format_number(backend_lowP, 0)
-            new_row['highP'] = format_number(latest_prices[item_id].get('high', row.get('highP')), 0)
+            # For percentile strategy, highP is the top-15% forecast ceiling — preserve it
+            if forecast_strategy == 'volume_percentile_median':
+                new_row['highP'] = format_number(row.get('highP', 0), 0)
+            else:
+                new_row['highP'] = format_number(latest_prices[item_id].get('high', row.get('highP')), 0)
             new_row['lowTime'] = f'{math.floor((now - latest_prices[item_id].get('lowTime', row.get('lowTime', 0)))/60)} min ago' if latest_prices[item_id].get('lowTime', 0) > 0 else 'None'
             new_row['highTime'] =  f'{math.floor((now - latest_prices[item_id].get('highTime', row.get('highTime', 0)))/60)} min ago' if latest_prices[item_id].get('highTime', 0) > 0 else 'None'
         else:
@@ -1310,7 +2077,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                     try:
                         ts = get_item_timeseries(item_id)
                     except Exception as e:
-                        print(f'[DEBUG] Error loading timeseries for item {item_id}: {e}')
                         ts = None
                     if ts and len(ts) == 5:
                         _, avgLowPrice, avgHighPrice, lowVol, highVol = ts
@@ -1368,7 +2134,7 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                             warning_msgs.append('High-Volume low!')
 
             except Exception as e:
-                print(f'[DEBUG] Error in spike detection for item {row.get("id", "")}: {e}')
+                pass
 
             if manipulation and warning_msgs:
                 warning_text = '; '.join(warning_msgs)
@@ -1377,7 +2143,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             if status == '':
                 status = 'Normal'
         except Exception as e:
-            print(f'[DEBUG] Error calculating status for item {row.get("id", "")}: {e}')
             status = ''
         new_row['status'] = status
         return new_row
@@ -1387,7 +2152,6 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
             # Apply status filter AFTER clean_row so we filter on GUI-rendered status
             status_filter_values = status_filter if isinstance(status_filter, list) else []
             if status_filter_values:
-                print(f"[DEBUG-GUI] Applying UI status filter on rendered rows: {status_filter_values}")
                 def _matches_status(row_status: str, selected_terms: list) -> bool:
                     s = (row_status or '').strip()
                     s_lower = s.lower()
@@ -1403,10 +2167,9 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
                     return False
                 data = [row for row in data if _matches_status(row.get('status', ''), status_filter_values)]
     except Exception as e:
-        print(f'[DEBUG] Error cleaning data rows or applying status filter: {e}')
+        pass
     # print('[DEBUG] Final data sample:', data[:3])
     # print('[DEBUG] Final columns:', columns)
-    print('[DEBUG] Before return, time:', time.time() - t_debug_start)
     # Generate update_text with data timestamps and refresh time
     try:
         one_h_dt, five_m_dt = get_update_times()
@@ -1432,10 +2195,8 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         
         update_text = " | ".join(time_parts)
     except Exception as e:
-        print(f"[DEBUG] Error generating update_text: {e}")
         update_text = f"Refresh: {dt_cls.now().strftime('%Y-%m-%d %H:%M:%S')}"
     
-    print('[DEBUG] Final update_text:', update_text)
     # Convert forecasted_prices to dict for charting
     forecasted_prices_dict = {}
     if isinstance(forecasted_prices, list):
@@ -1446,15 +2207,30 @@ def update_table_and_times(n_clicks, item_name_search_input, filter_by_watchlist
         forecasted_prices_dict = forecasted_prices
     else:
         forecasted_prices_dict = {}
+    # Keep RuneLite API cache in sync with the latest rendered forecast rows.
+    global _last_forecast_rows
+    _last_forecast_rows = data if isinstance(data, list) else []
+
     # Return only the four expected outputs - let DataTable manage selected_rows
     return data, columns, update_text, forecasted_prices_dict
 
 @app.callback(
     Output('timeseries-container', 'children'),
-    [Input('forecast-table', 'selected_rows'), Input('forecast-table', 'active_cell'), Input('forecast-table', 'data'), Input('forecasted-prices-store', 'data'), Input('forecast-sell-time', 'value'), Input('dark-mode-store', 'data')],
+    [
+        Input('forecast-table', 'selected_rows'),
+        Input('forecast-table', 'selected_row_ids'),
+        Input('forecast-table', 'active_cell'),
+        Input('forecast-table', 'derived_viewport_data'),
+        Input('forecast-table', 'data'),
+        Input('forecasted-prices-store', 'data'),
+        Input('forecast-sell-time', 'value'),
+        Input('chart-y-fit-btn', 'n_clicks'),
+        Input('chart-y-fit-pct', 'value'),
+        Input('dark-mode-store', 'data')
+    ],
     prevent_initial_call=False
 )
-def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, forecast_sell_time=0, dark_mode_data=None):
+def show_timeseries(selected_rows, selected_row_ids, active_cell, viewport_data, table_data, forecasted_prices, forecast_sell_time=0, y_fit_clicks=0, y_fit_pct=15, dark_mode_data=None):
     dark_mode = dark_mode_data.get('dark_mode', False) if dark_mode_data else False
     t_callback_start = time.perf_counter()
     t_fig1h_end = t_callback_start  # Initialize to avoid UnboundLocalError
@@ -1467,28 +2243,140 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
         pass
     
     print("=" * 80, flush=True)
-    print("[DEBUG-CALLBACK] show_timeseries CALLED!", flush=True)
-    print(f"[DEBUG-CALLBACK] selected_rows = {selected_rows}", flush=True)
-    print(f"[DEBUG-CALLBACK] active_cell = {active_cell}", flush=True)
     print("=" * 80, flush=True)
     
     if forecast_sell_time is None:
         forecast_sell_time = 0
+    y_fit_enabled = bool(y_fit_clicks and y_fit_clicks > 0)
+    y_fit_revision = int(y_fit_clicks or 0)
+    try:
+        y_fit_pct = float(y_fit_pct) if y_fit_pct is not None else 15.0
+    except (TypeError, ValueError):
+        y_fit_pct = 15.0
+    y_fit_pct = max(0.0, y_fit_pct)
 
-    # If no row selected, use the first row as default
+    graph_config = {
+        'scrollZoom': True,
+        'doubleClick': 'reset',
+        'modeBarButtonsToRemove': ['select2d', 'lasso2d']
+    }
+
+    def apply_default_window_and_zoom_controls(fig, time_values, default_window_days=0):
+        if not time_values:
+            return
+
+        parsed_times = []
+        for time_val in time_values:
+            try:
+                parsed = pandas_mod.to_datetime(time_val)
+            except Exception:
+                continue
+            if pandas_mod.isna(parsed):
+                continue
+            if hasattr(parsed, 'to_pydatetime'):
+                parsed = parsed.to_pydatetime()
+            parsed_times.append(parsed)
+
+        if not parsed_times:
+            return
+
+        range_start = min(parsed_times)
+        range_end = max(parsed_times)
+
+        if default_window_days > 0:
+            requested_start = range_end - timedelta(days=default_window_days)
+            if requested_start > range_start:
+                range_start = requested_start
+
+        fig.update_xaxes(
+            range=[range_start.strftime('%Y-%m-%d %H:%M:%S'), range_end.strftime('%Y-%m-%d %H:%M:%S')],
+            rangeslider=dict(visible=True),
+            rangeselector=dict(
+                x=0,
+                y=1.08,
+                xanchor='left',
+                yanchor='top',
+                bgcolor=_dump_alert_chart_control_theme()['bgcolor'],
+                activecolor=_dump_alert_chart_control_theme()['activecolor'],
+                bordercolor=_dump_alert_chart_control_theme()['bordercolor'],
+                borderwidth=_dump_alert_chart_control_theme()['borderwidth'],
+                buttons=[
+                    dict(count=1, label='1d', step='day', stepmode='backward'),
+                    dict(count=7, label='7d', step='day', stepmode='backward'),
+                    dict(count=30, label='30d', step='day', stepmode='backward'),
+                    dict(step='all', label='All')
+                ]
+            )
+        )
+
+        # Plotly sets y axes to fixedrange when x rangeslider is visible unless we override.
+        fig.update_yaxes(fixedrange=False)
+        fig.update_layout(dragmode='zoom')
+
+    def compute_robust_axis_range(*series, lower_q=0.01, upper_q=0.99, pad_ratio=0.20):
+        values = []
+        for seq in series:
+            if not seq:
+                continue
+            for v in seq:
+                if isinstance(v, (int, float)) and not math.isnan(v) and math.isfinite(v):
+                    values.append(float(v))
+
+        if len(values) < 2:
+            return None
+
+        arr = np.array(values, dtype=float)
+        lo = float(np.percentile(arr, lower_q * 100.0))
+        hi = float(np.percentile(arr, upper_q * 100.0))
+
+        if hi <= lo:
+            lo = float(np.min(arr))
+            hi = float(np.max(arr))
+            if hi <= lo:
+                span = max(abs(hi) * 0.05, 1.0)
+                lo -= span
+                hi += span
+
+        span = hi - lo
+        lo -= span * pad_ratio
+        hi += span * pad_ratio
+
+        if min(values) >= 0:
+            lo = max(0.0, lo)
+
+        if hi <= lo:
+            return None
+
+        return [lo, hi]
+
+    # Resolve selected item robustly across pagination/sorting.
     row = None
-    if isinstance(active_cell, dict) and active_cell.get('row') is not None:
-        row = active_cell.get('row')
-    elif selected_rows and len(selected_rows) > 0:
+    resolved_item_id = None
+
+    # Clicks are page-local; map through viewport rows to get the real item id.
+    if isinstance(active_cell, dict) and active_cell.get('row') is not None and isinstance(viewport_data, list):
+        viewport_row = active_cell.get('row')
+        if isinstance(viewport_row, int) and 0 <= viewport_row < len(viewport_data):
+            resolved_item_id = str(viewport_data[viewport_row].get('id'))
+
+    # selected_row_ids are stable across pages if available.
+    if resolved_item_id is None and selected_row_ids and len(selected_row_ids) > 0:
+        resolved_item_id = str(selected_row_ids[0])
+
+    # Fallback to legacy selected_rows index behavior.
+    if resolved_item_id is None and selected_rows and len(selected_rows) > 0:
         row = selected_rows[0]
-    elif table_data and len(table_data) > 0:
+    elif resolved_item_id is not None and table_data and isinstance(table_data, list):
+        for idx, candidate in enumerate(table_data):
+            if str(candidate.get('id')) == resolved_item_id:
+                row = idx
+                break
+
+    if row is None and table_data and len(table_data) > 0:
         row = 0  # Default to first row
-    
+
     if row is not None and table_data and isinstance(table_data, list) and 0 <= row < len(table_data):
         item_id = table_data[row]['id']
-        print(f"[DEBUG] Row {row}: table_data[row].keys() = {list(table_data[row].keys())}")
-        print(f"[DEBUG] Row {row}: lowP = {repr(table_data[row].get('lowP'))}, type = {type(table_data[row].get('lowP'))}")
-        print(f"[DEBUG] Row {row}: highP = {repr(table_data[row].get('highP'))}, type = {type(table_data[row].get('highP'))}")
 
         def parse_table_price(value):
             if value is None:
@@ -1501,15 +2389,12 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                     return None
                 cleaned = cleaned.replace(' ', '').replace('.', '').replace(',', '')
                 result = float(cleaned) if cleaned else None
-                print(f"[DEBUG] Parsed '{value}' -> '{cleaned}' -> {result}")
                 return result
             except Exception as e:
-                print(f"[DEBUG] Failed to parse '{value}': {e}")
                 return None
 
         line_low_price = parse_table_price(table_data[row].get('lowP'))
         line_high_price = parse_table_price(table_data[row].get('highP'))
-        print(f"[DEBUG] After parsing: line_low_price={line_low_price}, line_high_price={line_high_price}")
 
         if line_low_price is None:
             line_low_price = parse_table_price(table_data[row].get('buy_price'))
@@ -1518,13 +2403,12 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
         if line_high_price is None:
             line_high_price = parse_table_price(table_data[row].get('forecast_price'))
 
-        print(f"[DEBUG-GUI] Item {item_id}: dashed line lowP={line_low_price}, highP={line_high_price}")
         t_parse_end = time.perf_counter()
         print(f"[PERF] Price parsing: {(t_parse_end - t_callback_start):.3f}s", flush=True)
         
         # --- 1h chart (existing) ---
         t_data_load_start = time.perf_counter()
-        timestamps, avgLowPrice, avgHighPrice, lowVol, highVol = get_item_timeseries(item_id)
+        timestamps, avgLowPrice, avgHighPrice, lowVol, highVol = get_item_timeseries(item_id, hours_lookback=None)
         if not timestamps:
             print(f"[PERF] Data loaded (1h): {(time.perf_counter() - t_data_load_start):.3f}s", flush=True)
             t_callback_end = time.perf_counter()
@@ -1606,7 +2490,6 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
             final_low = line_low_price if line_low_price is not None else fallback_low
             final_high = line_high_price if line_high_price is not None else fallback_high
             
-            print(f"[DEBUG] Final dashed line values: low={final_low}, high={final_high}")
             
             # Always render dashed lines even if we had to use fallback values
             if final_low is not None and final_low > 0:
@@ -1630,11 +2513,15 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
         fig_1h.update_layout(
             title=f"Price & Volume History (1h) for {table_data[row].get('name', item_id)}",
             hovermode='closest',
+            # Keep shared UI state stable, then control persistence per-axis below.
+            uirevision='timeseries-1h-layout',
             yaxis=dict(
                 title='Price',
                 showgrid=True,
                 zeroline=True,
                 side='left',
+                # Include y-fit revision so Y Fit clicks apply immediately on the active chart.
+                uirevision=f'timeseries-1h-y-{item_id}-fit-{y_fit_revision}',
             ),
             yaxis2=dict(
                 title='Volume',
@@ -1642,12 +2529,18 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                 side='right',
                 showgrid=False,
                 zeroline=False,
+                uirevision=f'timeseries-1h-y2-{item_id}',
+            ),
+            xaxis=dict(
+                # Preserve selected x-window buttons/range across item changes.
+                uirevision='timeseries-1h-x-window'
             ),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
             template='plotly_dark' if dark_mode else 'plotly'
         )
         # Add forecasted_prices to the 1h chart if available
         forecasted = None
+        forecast_y = []
         if forecasted_prices:
             if isinstance(forecasted_prices, dict):
                 forecasted = forecasted_prices.get(item_id)
@@ -1733,9 +2626,16 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                     showlegend=False,
                     name='Sell Line'
                 ))
-            # Set x-axis range to show all data without excessive whitespace
-            fig_1h.update_xaxes(range=[full_x_range[0], full_x_range[-1]])
 
+        apply_default_window_and_zoom_controls(fig_1h, timestamps_shifted, 0)
+        if y_fit_enabled:
+            price_range_1h = _dump_alert_y_fit_range_from_lines(final_low, final_high, y_fit_pct)
+            if price_range_1h is not None:
+                fig_1h.update_yaxes(range=price_range_1h, fixedrange=False)
+
+        volume_range_1h = compute_robust_axis_range(lowVol, highVol, lower_q=0.01, upper_q=0.99, pad_ratio=0.22)
+        if volume_range_1h is not None:
+            fig_1h.update_layout(yaxis2=dict(range=volume_range_1h, title='Volume', overlaying='y', side='right', showgrid=False, zeroline=False))
         # Mark the end of 1h chart construction
         t_fig1h_end = time.perf_counter()
 
@@ -1879,17 +2779,20 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                     t_support_end = time.perf_counter()
                     print(f"[PERF] Support/resistance calculation: {(t_support_end - t_support_start):.3f}s", flush=True)
                 except Exception as e:
-                    print(f"[DEBUG] Error adding 5m support/resistance bands: {e}")
                     t_support_end = time.perf_counter()
                     print(f"[PERF] Support/resistance calculation (failed): {(t_support_end - t_support_start):.3f}s", flush=True)
                 fig_5m.update_layout(
                     title=f"Price & Volume History (5m) for {table_data[row].get('name', item_id)}",
                     hovermode='closest',
+                    # Keep shared UI state stable, then control persistence per-axis below.
+                    uirevision='timeseries-5m-layout',
                     yaxis=dict(
                         title='Price',
                         showgrid=True,
                         zeroline=True,
                         side='left',
+                        # Include y-fit revision so Y Fit clicks apply immediately on the active chart.
+                        uirevision=f'timeseries-5m-y-{item_id}-fit-{y_fit_revision}',
                     ),
                     yaxis2=dict(
                         title='Volume',
@@ -1897,10 +2800,26 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                         side='right',
                         showgrid=False,
                         zeroline=False,
+                        uirevision=f'timeseries-5m-y2-{item_id}',
+                    ),
+                    xaxis=dict(
+                        # Preserve selected x-window buttons/range across item changes.
+                        uirevision='timeseries-5m-x-window'
                     ),
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                     template='plotly_dark' if dark_mode else 'plotly'
                 )
+                apply_default_window_and_zoom_controls(fig_5m, ts_5m, 0)
+                if y_fit_enabled:
+                    price_range_5m = _dump_alert_y_fit_range_from_lines(final_low_5m, final_high_5m, y_fit_pct)
+                    if price_range_5m is not None:
+                        fig_5m.update_yaxes(range=price_range_5m, fixedrange=False)
+
+                support_vals = list(price_df_5m['support']) if 'price_df_5m' in locals() and 'support' in price_df_5m else []
+                resistance_vals = list(price_df_5m['resistance']) if 'price_df_5m' in locals() and 'resistance' in price_df_5m else []
+                volume_range_5m = compute_robust_axis_range(lowVol_5m, highVol_5m, lower_q=0.01, upper_q=0.99, pad_ratio=0.22)
+                if volume_range_5m is not None:
+                    fig_5m.update_layout(yaxis2=dict(range=volume_range_5m, title='Volume', overlaying='y', side='right', showgrid=False, zeroline=False))
                 # Return both charts stacked vertically
                 t_callback_end = time.perf_counter()
                 elapsed = t_callback_end - t_callback_start
@@ -1910,9 +2829,9 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                 print(f"[PERF] Breakdown: data_load={t_data_load_dur:.3f}s, fig1h={t_fig1h_dur:.3f}s, 5m_all={t_5m_all_dur:.3f}s", flush=True)
                 print(f"[PERF] show_timeseries callback (both charts) in {elapsed:.3f}s", flush=True)
                 return html.Div([
-                    dcc.Graph(figure=fig_1h),
+                    dcc.Graph(figure=fig_1h, config=graph_config),
                     html.Hr(),
-                    dcc.Graph(figure=fig_5m)
+                    dcc.Graph(figure=fig_5m, config=graph_config)
                 ])
             else:
                 # No 5m data, just show 1h chart
@@ -1921,11 +2840,10 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
                 print(f"[PERF] Breakdown: data_load={(t_fig1h_start - t_data_load_start):.3f}s, fig1h={(t_fig1h_end - t_fig1h_start):.3f}s, 5m_load=0s, 5m_construct=0s", flush=True)
                 print(f"[PERF] show_timeseries callback (1h only) in {elapsed:.3f}s", flush=True)
                 return html.Div([
-                    dcc.Graph(figure=fig_1h),
+                    dcc.Graph(figure=fig_1h, config=graph_config),
                     html.Div('No 5m data available for this item.', style={'color': 'gray', 'marginTop': '10px'})
                 ])
         except Exception as e:
-            print(f"[DEBUG] Error loading/plotting 5m data: {e}")
             if 't_fig1h_end' not in locals():
                 t_fig1h_end = time.perf_counter()
             t_callback_end = time.perf_counter()
@@ -1935,7 +2853,7 @@ def show_timeseries(selected_rows, active_cell, table_data, forecasted_prices, f
             print(f"[PERF] Breakdown: data_load={t_data_load_dur:.3f}s, fig1h={t_fig1h_dur:.3f}s, 5m_error", flush=True)
             print(f"[PERF] show_timeseries callback (error) in {elapsed:.3f}s", flush=True)
             return html.Div([
-                dcc.Graph(figure=fig_1h),
+                dcc.Graph(figure=fig_1h, config=graph_config),
                 html.Div('Error loading 5m data.', style={'color': 'red', 'marginTop': '10px'})
             ])
     t_callback_end = time.perf_counter()
@@ -2120,14 +3038,11 @@ def template_save_load_callback(save_clicks, load_clicks, delete_clicks, templat
     [State('forecast-table', 'selected_rows'), State('forecast-table', 'data')]
 )
 def add_selected_to_watchlist(n_clicks, selected_rows, table_data):
-    print('[DEBUG] add_selected_to_watchlist called')
     if n_clicks and n_clicks > 0:
         if not selected_rows or not table_data:
-            print('[DEBUG] No selected row or table data')
             return 'No row selected.'
         row_idx = selected_rows[0] if isinstance(selected_rows, list) and selected_rows else None
         if row_idx is None or row_idx < 0 or row_idx >= len(table_data):
-            print(f'[DEBUG] Invalid row index: {row_idx}')
             return 'Invalid row selected.'
         item = table_data[row_idx]
         item_id = item.get('id')
@@ -2141,7 +3056,6 @@ def add_selected_to_watchlist(n_clicks, selected_rows, table_data):
             watchlist = []
         existing_item = next((w for w in watchlist if str(w.get('item_id')) == str(item_id)), None)
         if existing_item:
-            print(f'[DEBUG] Item {item_id} already in watchlist')
             return f'Item {item_name} already in watchlist.'
         new_entry = {
             'item_id': item_id,
@@ -2154,13 +3068,236 @@ def add_selected_to_watchlist(n_clicks, selected_rows, table_data):
         try:
             with open(watchlist_path, 'w', encoding='utf-8') as f:
                 json.dump(watchlist, f, ensure_ascii=False, indent=2)
-            print(f'[DEBUG] Added {item_name} to watchlist')
             return f'Added {item_name} to watchlist.'
         except Exception as e:
             print(f'[ERROR] Failed to save watchlist: {e}')
             return f'Error saving watchlist: {e}'
-    print('[DEBUG] Button not clicked yet')
     return dash.no_update
+
+
+@app.callback(
+    [
+        Output('dump-alert-table', 'data'),
+        Output('dump-alert-table', 'style_data_conditional'),
+        Output('dump-alert-formula-help', 'children'),
+        Output('dump-alert-status', 'children'),
+        Output('dump-alert-new-summary', 'children'),
+        Output('dump-alert-last-refresh', 'children'),
+        Output('dump-alert-refresh-state-store', 'data'),
+        Output('dump-alert-sound-signal', 'data'),
+    ],
+    [
+        Input('dump-alert-refresh-btn', 'n_clicks'),
+        Input('dump-alert-interval', 'n_intervals'),
+        Input('dump-alert-threshold-pct', 'value'),
+        Input('dump-alert-min-gp-drop', 'value'),
+        Input('dump-alert-min-avg-daily-volume', 'value'),
+        Input('dump-alert-min-potential-profit', 'value'),
+        Input('dump-alert-min-volume-potential', 'value'),
+        Input('dump-alert-volume-power', 'value'),
+        Input('dump-alert-max-qty-factor', 'value'),
+        Input('dump-alert-metrics', 'value'),
+        Input('dump-alert-windows', 'value'),
+        Input('dump-alert-custom-windows', 'value'),
+        Input('dump-alert-options', 'value'),
+        Input('dump-alert-new-options', 'value'),
+        Input('dump-alert-auto-refresh', 'value'),
+        Input('dump-alert-auto-refresh-minutes', 'value'),
+    ],
+    State('dump-alert-refresh-state-store', 'data'),
+    prevent_initial_call=False
+)
+def update_dump_alert_table(_refresh_clicks, _n_intervals, threshold_pct, min_gp_drop, min_avg_daily_volume, min_potential_profit, min_volume_potential, volume_power, max_qty_factor, metric_values, window_values, custom_windows_text, alert_options, new_options, auto_refresh_value, auto_refresh_minutes, refresh_state):
+    ctx = dash.callback_context
+    trigger = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else 'initial-load'
+    effective_windows = _merged_dump_alert_windows(window_values, custom_windows_text)
+    rows, items_scanned, refreshed_5m, threshold_pct, min_gp_drop, min_avg_daily_volume, min_potential_profit, min_volume_potential, volume_power, max_qty_factor, metric_values, window_values = _build_dump_alert_rows(
+        threshold_pct,
+        min_gp_drop,
+        min_avg_daily_volume,
+        min_potential_profit,
+        min_volume_potential,
+        volume_power,
+        max_qty_factor,
+        metric_values,
+        effective_windows,
+    )
+    refresh_state = refresh_state or {}
+    previous_keys = set(refresh_state.get('keys') or [])
+    sticky_previous_keys = set(refresh_state.get('sticky_new_keys') or [])
+    current_keys = [row['alert_key'] for row in rows]
+    current_key_set = set(current_keys)
+    is_first_load = not refresh_state.get('keys') and not refresh_state.get('sticky_new_keys')
+    new_alert_keys = [] if is_first_load else [key for key in current_keys if key not in previous_keys]
+    new_alert_key_set = set(new_alert_keys)
+    highlight_enabled = 'highlight' in (alert_options or [])
+    sound_enabled = 'sound' in (alert_options or [])
+    show_new_only = 'show_new_only' in (new_options or [])
+    sticky_new_enabled = 'sticky_new' in (new_options or [])
+    auto_refresh_enabled = 'enabled' in (auto_refresh_value or [])
+
+    if sticky_new_enabled:
+        if trigger == 'dump-alert-refresh-btn':
+            effective_new_key_set = set(new_alert_keys)
+        else:
+            effective_new_key_set = (sticky_previous_keys | new_alert_key_set) & current_key_set
+    else:
+        effective_new_key_set = new_alert_key_set
+
+    for row in rows:
+        row['is_new'] = 1 if row['alert_key'] in effective_new_key_set else 0
+
+    if show_new_only:
+        rows = [row for row in rows if row['is_new'] == 1]
+
+    rows.sort(key=lambda row: (-row['is_new'], -row['drop_pct'], -row['gp_drop'], row['window_minutes'], row['item_name']))
+
+    table_styles = _dump_alert_base_table_styles()
+    if highlight_enabled:
+        table_styles.insert(0, {
+            'if': {'filter_query': '{is_new} = 1'},
+            'backgroundColor': '#fff6d8',
+            'boxShadow': 'inset 4px 0 0 #e3a008',
+        })
+        table_styles.insert(1, {
+            'if': {'filter_query': '{is_new} = 1', 'column_id': 'item_name'},
+            'fontWeight': 'bold',
+        })
+
+    formula_help_text = (
+        f'Formula (live): max_qty = min(int(base_qty * {max_qty_factor:.2f}), buy_limit); '
+        f'potential_profit = max(0, (reference_price * (1 - {GE_TAX:.2f}) - current_price) * max_qty); '
+        f'volume_potential = floor(log10(|potential_profit| * avg_daily_volume^{volume_power:.2f}) * 100) / 100 when value > 1, else 0.'
+    )
+
+    metric_labels = ', '.join(_dump_alert_metric_label(metric) for metric in metric_values)
+    window_label = ', '.join(f'{window}m' for window in window_values)
+    status_text = (
+        f'{len(rows)} dump alerts triggered across {items_scanned} scanned items '
+        f'using {metric_labels} over {window_label} with thresholds of {threshold_pct:.1f}% drop, '
+        f'{min_gp_drop:.0f} gp drop, {min_avg_daily_volume:.0f} daily volume, '
+        f'{min_potential_profit:.0f} potential profit, {min_volume_potential:.2f} volume potential, '
+        f'volume weight {volume_power:.2f}, and amount multiplier {max_qty_factor:.2f}.'
+    )
+    if new_alert_keys:
+        status_text += f' {len(new_alert_keys)} new alert(s) were just triggered.'
+    if show_new_only:
+        status_text += ' Showing only new alerts.'
+    refresh_source = 'fresh 5m data' if refreshed_5m else 'cached 5m data'
+    refreshed_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        refresh_minutes = int(float(auto_refresh_minutes)) if auto_refresh_minutes is not None else 5
+    except (TypeError, ValueError):
+        refresh_minutes = 5
+    refresh_minutes = min(1440, max(1, refresh_minutes))
+    auto_refresh_label = f'enabled ({refresh_minutes} min)' if auto_refresh_enabled else 'disabled'
+    last_refresh_text = f'Last refresh: {refreshed_at} using {refresh_source}. Auto-refresh is {auto_refresh_label}.'
+    new_summary_text = (
+        f'New since last refresh: {len(new_alert_keys)}. '
+        f'Marked as new right now: {len(effective_new_key_set)}.'
+    )
+    if sticky_new_enabled:
+        new_summary_text += ' New markers persist across auto-refreshes until you press Refresh Now.'
+    refresh_state_payload = {
+        'keys': list(current_key_set),
+        'sticky_new_keys': list(effective_new_key_set) if sticky_new_enabled else [],
+    }
+    sound_signal = {
+        'play': bool(sound_enabled and new_alert_keys),
+        'new_alert_count': len(new_alert_keys),
+        'nonce': int(time.time() * 1000),
+    }
+    return rows, table_styles, formula_help_text, status_text, new_summary_text, last_refresh_text, refresh_state_payload, sound_signal
+
+
+@app.callback(
+    Output('dump-alert-timeseries-container', 'children'),
+    [
+        Input('dump-alert-table', 'selected_rows'),
+        Input('dump-alert-table', 'selected_row_ids'),
+        Input('dump-alert-table', 'active_cell'),
+        Input('dump-alert-table', 'derived_viewport_data'),
+        Input('dump-alert-table', 'data'),
+        Input('dump-alert-chart-y-fit-btn', 'n_clicks'),
+        Input('dump-alert-chart-y-fit-pct', 'value'),
+        Input('dark-mode-store', 'data'),
+    ],
+    prevent_initial_call=False
+)
+def show_dump_alert_timeseries(selected_rows, selected_row_ids, active_cell, viewport_data, table_data, y_fit_clicks=0, y_fit_pct=15, dark_mode_data=None):
+    adapted_table_data = []
+    source_rows = table_data if isinstance(table_data, list) else []
+    for row in source_rows:
+        adapted_row = _dump_alert_chart_row_from_result(row)
+        if adapted_row is not None:
+            adapted_table_data.append(adapted_row)
+
+    adapted_viewport_data = []
+    source_viewport = viewport_data if isinstance(viewport_data, list) else []
+    for row in source_viewport:
+        adapted_row = _dump_alert_chart_row_from_result(row)
+        if adapted_row is not None:
+            adapted_viewport_data.append(adapted_row)
+
+    if not adapted_table_data:
+        return html.Div('No dump alert data available for charting.')
+
+    if not selected_row_ids:
+        selected_row_ids = [adapted_table_data[0]['id']]
+
+    if not selected_rows:
+        selected_rows = [0]
+
+    return show_timeseries(
+        selected_rows,
+        selected_row_ids,
+        active_cell,
+        adapted_viewport_data,
+        adapted_table_data,
+        {},
+        0,
+        y_fit_clicks,
+        y_fit_pct,
+        dark_mode_data,
+    )
+
+
+app.clientside_callback(
+    """
+    function(signal) {
+        if (!signal || !signal.play || !signal.new_alert_count) {
+            return window.dash_clientside.no_update;
+        }
+        try {
+            const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextCtor) {
+                return 'audio-unsupported';
+            }
+            const audioContext = new AudioContextCtor();
+            const tones = Math.min(signal.new_alert_count, 3);
+            for (let index = 0; index < tones; index += 1) {
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                oscillator.type = 'triangle';
+                oscillator.frequency.value = 880 + (index * 110);
+                gainNode.gain.setValueAtTime(0.0001, audioContext.currentTime + (index * 0.16));
+                gainNode.gain.exponentialRampToValueAtTime(0.12, audioContext.currentTime + 0.02 + (index * 0.16));
+                gainNode.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.13 + (index * 0.16));
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                oscillator.start(audioContext.currentTime + (index * 0.16));
+                oscillator.stop(audioContext.currentTime + 0.14 + (index * 0.16));
+            }
+            return 'played-' + signal.nonce;
+        } catch (error) {
+            return 'audio-error';
+        }
+    }
+    """,
+    Output('dump-alert-sound-dummy', 'children'),
+    Input('dump-alert-sound-signal', 'data'),
+    prevent_initial_call=True,
+)
 
 # --- Watchlist Table Update Callback ---
 
@@ -2231,6 +3368,75 @@ def add_selected_to_watchlist(n_clicks, selected_rows, table_data):
 
 # # --- Debug callbacks for add-watchlist-status removed (lines 1372-1540) ---
 
+# ---------------------------------------------------------------------------
+# REST API for RuneLite plugin  (served on app.server — same Flask instance)
+# Endpoints:
+#   GET /api/watchlist          → watchlist items with latest prices
+#   GET /api/forecast           → last computed forecast table rows (cached)
+# ---------------------------------------------------------------------------
+from flask import jsonify as _jsonify
+
+# Simple in-process store so the plugin can read the last forecast result
+# without triggering a full recompute.  Updated by the Dash callback.
+_last_forecast_rows: list = []
+
+
+@app.server.route('/api/watchlist')
+def api_watchlist():
+    """Return watchlist items enriched with the latest RS Wiki prices."""
+    watchlist_path = os.path.join(APP_DIR, 'Data', 'watchlist.json')
+    try:
+        with open(watchlist_path, 'r', encoding='utf-8') as f:
+            items = json.load(f)
+    except Exception:
+        items = []
+    latest_prices = get_latest_prices()
+    result = []
+    for item in items:
+        item_id = str(item.get('item_id', ''))
+        price_data = latest_prices.get(item_id, {})
+        low_p = price_data.get('low', 0)
+        high_p = price_data.get('high', 0)
+        entry_price = float(item.get('entry_price', 0) or 0)
+        quantity = int(item.get('quantity', 1) or 1)
+        tax = high_p * 0.02
+        potential_profit = round((high_p - tax - entry_price) * quantity, 2) if high_p > 0 and entry_price > 0 else 0
+        result.append({
+            'item_id': item_id,
+            'item_name': item.get('item_name', ''),
+            'entry_price': entry_price,
+            'quantity': quantity,
+            'low_price': low_p,
+            'high_price': high_p,
+            'potential_profit': potential_profit,
+            'added_time': item.get('added_time', ''),
+        })
+    return _jsonify(result)
+
+
+@app.server.route('/api/forecast')
+def api_forecast():
+    """Return the last set of forecast rows computed by the Dash callback."""
+    # _last_forecast_rows is populated by update_table_and_times via the store below.
+    # If empty, return an empty list — the plugin will show a 'no data' message.
+    safe_rows = []
+    for row in _last_forecast_rows:
+        safe_rows.append({
+            'item_id': str(row.get('id', '')),
+            'item_name': row.get('name', ''),
+            'low_price': row.get('lowP', ''),
+            'high_price': row.get('highP', ''),
+            'forecast_price': row.get('forecast_price', ''),
+            'profit': row.get('profit', ''),
+            'roi': row.get('roi', ''),
+            'potential_profit': row.get('potential_profit', ''),
+            'trend': row.get('trend_direction', ''),
+            'risk_level': row.get('risk_level', ''),
+            'status': row.get('status', ''),
+        })
+    return _jsonify(safe_rows)
+
+
 # --- Main block to launch Dash app and update 5m data on startup ---
 if __name__ == '__main__':
     import json
@@ -2238,13 +3444,8 @@ if __name__ == '__main__':
     import traceback
     
     try:
-        print(f"[DEBUG] APP_DIR: {APP_DIR}")
-        print(f"[DEBUG] sys.frozen: {getattr(sys, 'frozen', False)}")
-        print(f"[DEBUG] sys.executable: {sys.executable}")
         
         DATA_DIR = os.path.join(APP_DIR, 'Data')
-        print(f"[DEBUG] DATA_DIR: {DATA_DIR}")
-        print(f"[DEBUG] DATA_DIR exists: {os.path.exists(DATA_DIR)}")
         
         FIVE_M_FILE = os.path.join(DATA_DIR, '5m_data_cache.json')
         
@@ -2273,7 +3474,6 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"Error fetching 5m data on startup: {e}")
         
-        print("[DEBUG] Starting Dash app...")
         app.run(
             debug=False,
             use_reloader=False,

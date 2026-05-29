@@ -61,11 +61,13 @@ import json
 import math
 import sys
 from datetime import datetime, timedelta
-from forecast_helpers import forecast_avg_price
+import time
+from forecast_helpers import forecast_avg_price, volume_percentile_median_forecast
 import numpy as np
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, 'Data')
+_LATEST_PRICES_CACHE = {'fetched_at': 0.0, 'data': {}, 'ttl_seconds': 30.0}
 TEMPLATE_FILE = os.path.join(DATA_DIR, 'filter_templates.json')
 MAPPING_FILE = os.path.join(DATA_DIR, 'mapping_cache.json')
 FIVE_M_FILE = os.path.join(DATA_DIR, '5m_data_cache.json')
@@ -158,19 +160,53 @@ def assess_risk_level(risk_metrics):
     else:
         return 'Low Risk'
 
-def load_json(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+def load_json(path, default=None, retries=3, retry_delay=0.05):
+    if default is None:
+        default = {}
+
+    def _load_backup_json(primary_path):
+        backup_path = f"{primary_path}.bak"
+        if not os.path.exists(backup_path):
+            return default
+        try:
+            with open(backup_path, 'r', encoding='utf-8') as f:
+                raw_backup = f.read()
+            if not raw_backup or not raw_backup.strip():
+                return default
+            return json.loads(raw_backup)
+        except Exception:
+            return default
+
+    for attempt in range(max(1, int(retries))):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = f.read()
+
+            # Empty files can appear during interrupted writes; treat as missing data.
+            if not raw or not raw.strip():
+                return default
+
+            return json.loads(raw)
+        except FileNotFoundError:
+            return default
+        except json.JSONDecodeError as e:
+            if attempt < max(1, int(retries)) - 1:
+                time.sleep(float(retry_delay) * (attempt + 1))
+                continue
+            print(f"[JSON ERROR] Could not parse {path}: {e}")
+            return _load_backup_json(path)
+        except OSError as e:
+            print(f"[FILE ERROR] Could not read {path}: {e}")
+            return _load_backup_json(path)
 
 _PRICE_HISTORY_CACHE = {
     'mtime': None,
     'data': None,
+    'loaded_at': 0.0,
 }
-_ITEM_PRICE_HISTORY_CACHE = {
-    'mtime': None,
-    'lookback_hours': None,
-    'data': None,
-}
+_PRICE_HISTORY_CACHE_TTL_SECS = 60  # don't reload the 650 MB file more than once per minute
+_ITEM_PRICE_HISTORY_CACHE = {}  # {hours_lookback: {'mtime': ..., 'data': ...}}
+_ITEM_PRICE_HISTORY_CACHE_MAX_SLOTS = 4
 
 
 def _get_price_history_file_mtime():
@@ -182,13 +218,23 @@ def _get_price_history_file_mtime():
 
 def _get_price_history_cached():
     current_mtime = _get_price_history_file_mtime()
-    if _PRICE_HISTORY_CACHE['data'] is None or _PRICE_HISTORY_CACHE['mtime'] != current_mtime:
-        _PRICE_HISTORY_CACHE['data'] = load_json(PRICE_HISTORY_FILE)
-        _PRICE_HISTORY_CACHE['mtime'] = current_mtime
+    now = time.time()
+    # Skip disk read if data is fresh enough, even when mtime has changed.
+    # Price_History.json is ~650 MB; reloading it on every mtime change causes
+    # 13-18 s stalls. Prices only update hourly so 60 s staleness is fine.
+    if (
+        _PRICE_HISTORY_CACHE['data'] is not None
+        and (now - _PRICE_HISTORY_CACHE['loaded_at']) < _PRICE_HISTORY_CACHE_TTL_SECS
+    ):
+        return _PRICE_HISTORY_CACHE['data']
 
-        _ITEM_PRICE_HISTORY_CACHE['data'] = None
-        _ITEM_PRICE_HISTORY_CACHE['mtime'] = current_mtime
-        _ITEM_PRICE_HISTORY_CACHE['lookback_hours'] = None
+    if _PRICE_HISTORY_CACHE['data'] is None or _PRICE_HISTORY_CACHE['mtime'] != current_mtime:
+        fallback_data = _PRICE_HISTORY_CACHE['data'] if isinstance(_PRICE_HISTORY_CACHE['data'], dict) else {}
+        loaded_data = load_json(PRICE_HISTORY_FILE, default=fallback_data)
+        _PRICE_HISTORY_CACHE['data'] = loaded_data if isinstance(loaded_data, dict) else fallback_data
+        _PRICE_HISTORY_CACHE['mtime'] = current_mtime
+        _PRICE_HISTORY_CACHE['loaded_at'] = now
+        _ITEM_PRICE_HISTORY_CACHE.clear()
 
     return _PRICE_HISTORY_CACHE['data']
 
@@ -197,16 +243,18 @@ def _get_item_price_history_cached(hours_lookback=168):
     price_history = _get_price_history_cached()
     current_mtime = _PRICE_HISTORY_CACHE['mtime']
 
-    if (
-        _ITEM_PRICE_HISTORY_CACHE['data'] is None
-        or _ITEM_PRICE_HISTORY_CACHE['mtime'] != current_mtime
-        or _ITEM_PRICE_HISTORY_CACHE['lookback_hours'] != hours_lookback
-    ):
-        _ITEM_PRICE_HISTORY_CACHE['data'] = get_item_price_history(price_history, hours_lookback)
-        _ITEM_PRICE_HISTORY_CACHE['mtime'] = current_mtime
-        _ITEM_PRICE_HISTORY_CACHE['lookback_hours'] = hours_lookback
+    slot = _ITEM_PRICE_HISTORY_CACHE.get(hours_lookback)
+    if slot is None or slot['mtime'] != current_mtime:
+        # Evict oldest entry if the cache is full to bound memory usage.
+        if len(_ITEM_PRICE_HISTORY_CACHE) >= _ITEM_PRICE_HISTORY_CACHE_MAX_SLOTS:
+            oldest_key = next(iter(_ITEM_PRICE_HISTORY_CACHE))
+            del _ITEM_PRICE_HISTORY_CACHE[oldest_key]
+        _ITEM_PRICE_HISTORY_CACHE[hours_lookback] = {
+            'mtime': current_mtime,
+            'data': get_item_price_history(price_history, hours_lookback),
+        }
 
-    return _ITEM_PRICE_HISTORY_CACHE['data']
+    return _ITEM_PRICE_HISTORY_CACHE[hours_lookback]['data']
 
 def get_update_times():
     try:
@@ -221,14 +269,9 @@ def get_update_times():
     except Exception:
         five_m_dt = None
     try:
-        with open(PRICE_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                if '"' in line:
-                    break
-            f.seek(0)
-            data = json.load(f)
+        data = _get_price_history_cached()
         if data:
-            ts_keys = [k for k in data.keys() if k[0].isdigit()]
+            ts_keys = [k for k in data.keys() if k and k[0].isdigit()]
             if ts_keys:
                 one_h_dt = datetime.strptime(max(ts_keys), '%Y-%m-%d %H:%M:%S')
             else:
@@ -240,33 +283,61 @@ def get_update_times():
     return one_h_dt, five_m_dt
 
 def get_latest_prices():
+    now_ts = time.time()
+    if _LATEST_PRICES_CACHE['data'] and (now_ts - _LATEST_PRICES_CACHE['fetched_at'] <= _LATEST_PRICES_CACHE['ttl_seconds']):
+        return _LATEST_PRICES_CACHE['data']
+
     try:
         import requests
         resp = requests.get("https://prices.runescape.wiki/api/v1/osrs/latest", timeout=10)
         if resp.status_code == 200:
-            return resp.json()['data']
+            data = resp.json().get('data', {})
+            _LATEST_PRICES_CACHE['data'] = data
+            _LATEST_PRICES_CACHE['fetched_at'] = now_ts
+            return data
         print("[ERROR] Could not fetch latest prices from RS Wiki API: HTTP", resp.status_code)
-        return {}
+        return _LATEST_PRICES_CACHE['data'] if _LATEST_PRICES_CACHE['data'] else {}
     except Exception as e:
         print("[ERROR] Could not fetch latest prices from RS Wiki API:", e)
-        return {}
+        return _LATEST_PRICES_CACHE['data'] if _LATEST_PRICES_CACHE['data'] else {}
 
 
-def get_5m_prices():
-    
-    data = load_json(FIVE_M_FILE)
+_FIVE_M_CACHE = {'mtime': None, 'data': None, 'prices_by_chunk_window': {}}
+
+def _get_five_m_file_mtime():
+    try:
+        return os.path.getmtime(FIVE_M_FILE)
+    except OSError:
+        return None
+
+def get_5m_prices(max_chunks=None):
+    current_mtime = _get_five_m_file_mtime()
+
+    if (
+        _FIVE_M_CACHE.get('data') is None
+        or _FIVE_M_CACHE.get('mtime') != current_mtime
+    ):
+        fallback_data = _FIVE_M_CACHE.get('data') if isinstance(_FIVE_M_CACHE.get('data'), dict) else {}
+        data = load_json(FIVE_M_FILE, default=fallback_data)
+        _FIVE_M_CACHE['data'] = data if isinstance(data, dict) else fallback_data
+        _FIVE_M_CACHE['mtime'] = current_mtime
+        _FIVE_M_CACHE['prices_by_chunk_window'] = {}
+
+    window_key = int(max_chunks) if isinstance(max_chunks, int) and max_chunks > 0 else None
+    window_cache = _FIVE_M_CACHE.setdefault('prices_by_chunk_window', {})
+    if window_key in window_cache:
+        return window_cache[window_key]
+
+    data = _FIVE_M_CACHE.get('data') or {}
     chunks = data.get('chunks', [])
-
-    import datetime
-    import time
-        
+    if window_key is not None and len(chunks) > window_key:
+        chunks = chunks[-window_key:]
 
     prices = {}
-
     for chunk in chunks:
         if chunk is None:
             continue
-        ts = chunk['timestamp']
+        ts = chunk.get('timestamp')
         data_chunk = chunk.get('data', {}).get('data', {})
         for item_id, entry in data_chunk.items():
             if item_id not in prices:
@@ -275,20 +346,29 @@ def get_5m_prices():
             entry_copy['timestamp'] = ts
             prices[item_id].append(entry_copy)
 
+    window_cache[window_key] = prices
     return prices
-        
 
 
 def get_item_price_history(price_history, hours_lookback=168):
     now = datetime.utcnow()
-    cutoff = now - timedelta(hours=hours_lookback)
+    cutoff = None
+    if hours_lookback is not None:
+        try:
+            lookback_hours = float(hours_lookback)
+        except Exception:
+            lookback_hours = 168.0
+        if lookback_hours > 0:
+            cutoff = now - timedelta(hours=lookback_hours)
+
     item_prices = {}
-    for ts_str, ts_data in price_history.items():
+    for ts_str in sorted(price_history.keys()):
+        ts_data = price_history.get(ts_str, {})
         try:
             ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
         except Exception:
             continue
-        if ts < cutoff:
+        if cutoff is not None and ts < cutoff:
             continue
         for item_id, pdata in ts_data.get('data', {}).items():
             if item_id not in item_prices:
@@ -301,6 +381,11 @@ def get_item_price_history(price_history, hours_lookback=168):
                 'highPriceVolume': pdata.get('highPriceVolume')
             }
             item_prices[item_id].append(entry)
+
+    # Safety: ensure each per-item series is chronological even if source ordering changed.
+    for item_id in list(item_prices.keys()):
+        item_prices[item_id].sort(key=lambda e: e.get('timestamp', ''))
+
     return item_prices
 
 def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', name_filter = [], max_avg_trade_time=None, volume_power = 1, max_qty_factor=1, forecast_hours = 48, buy_price_type='low', forecast_price_type='avg'):
@@ -344,11 +429,11 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
     if name_filter != []:
         filtered_mapping = {item_id: info for item_id, info in mapping.items() if any(nf.lower() in info['name'].lower() for nf in name_filter)}
         mapping = filtered_mapping
-    price_history = load_json(PRICE_HISTORY_FILE)
+    item_history_chart = _get_item_price_history_cached(forecast_hours)
 
-    item_history_chart = get_item_price_history(price_history, forecast_hours)
-    
-    item_history_5m = get_5m_prices()
+    # Short-horizon forecasts only need recent 5m history; this cuts compute and JSON parsing cost.
+    five_m_chunk_window = 36 if forecast_sell_time_val <= 180 else None
+    item_history_5m = get_5m_prices(max_chunks=five_m_chunk_window)
 
     if forecast_sell_time_val <= 180:
         item_history = item_history_5m
@@ -369,7 +454,6 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
     
     # unique_item_ids = [item_id for item_id in unique_item_ids if item_id == '7946']
     
-    print('[DEBUG] Starting forecast with ')
 
     now = time.time()
 
@@ -619,18 +703,12 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
                         # Use volume-weighted average
                         buy_price = total_weighted_price / total_volume
                         buy_price = int(round(buy_price))
-                        print(f"[DEBUG] Item {item_id}: 30min weighted avg = {buy_price}")
-                        print(f"[DEBUG]   Valid entries: {valid_entries_count}/{len(recent_entries)}, Total volume: {total_volume}")
-                        print(f"[DEBUG]   All entries: {debug_entries}")
-                        print(f"[DEBUG]   Current low price: {latest.get('low', 0)}")
                     else:
                         # Fallback to current low price if no volume data
                         buy_price = int(latest.get('low', 0))
-                        print(f"[DEBUG] Item {item_id}: No volume data for 30min avg (entries: {debug_entries}), using current low = {buy_price}")
                 else:
                     # Fallback to current low price if no 5m data available
                     buy_price = int(latest.get('low', 0))
-                    print(f"[DEBUG] Item {item_id}: No 5m data available (len={len(hist_5m) if hist_5m else 0}), using current low = {buy_price}")
             else:  # default to 'low'
                 buy_price = int(latest.get('low', 0))
             
@@ -638,13 +716,23 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
                 buy_price = int(float(buy_price))
             except (TypeError, ValueError):
                 buy_price = 0
-            
-            # Calculate profit
+
+            # For the volume percentile median strategy, override buy price with the
+            # bottom-15% volume-weighted low price from history (stable buy floor)
+            if forecast_strategy == 'volume_percentile_median':
+                pct_buy = volume_percentile_median_forecast(
+                    forecast_hist, steps=1, forecast_price_type='low', direction='low'
+                )
+                if pct_buy and pct_buy[0] > 0:
+                    buy_price = int(pct_buy[0])
+
+            # Calculate profit using integer GP prices end-to-end.
             if buy_price <= 0 or forecast_price is None or forecast_price <= 0:
                 profit = 0
             else:
-                profit = forecast_price * (1-GE_TAX) - buy_price
-            profit = math.ceil(profit) if profit > 0 else 0
+                taxed_sell_price = int(math.floor(forecast_price * (1 - GE_TAX)))
+                profit = taxed_sell_price - buy_price
+            profit = int(profit) if profit > 0 else 0
             # Calculate ROI
             roi = profit / buy_price if buy_price else 0
             # Calculate rel_spread
@@ -822,16 +910,25 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
             
             # Debug: log first few status values
             if len(results_for_table) < 5:
-                print(f"[DEBUG-BACKEND] Item {item_id} ({name}): status_msgs={status_msgs}, status={status}")
+                pass
             
-            # Use buy_price for lowP only when avg_low_30min is selected
-            display_low_price = buy_price if buy_price_type == 'avg_low_30min' else latest.get('low', 0)
-            
+            # Use percentile prices for lowP/highP when percentile strategy is active;
+            # otherwise use live latest prices (or 30min avg for buy price type)
+            if forecast_strategy == 'volume_percentile_median':
+                display_low_price = buy_price   # already bottom-15% percentile floor
+                display_high_price = forecast_price  # already top-15% percentile ceiling
+            elif buy_price_type == 'avg_low_30min':
+                display_low_price = buy_price
+                display_high_price = latest.get('high', 0)
+            else:
+                display_low_price = latest.get('low', 0)
+                display_high_price = latest.get('high', 0)
+
             row = {
                 'id': item_id,
                 'name': name,
                 'lowP': display_low_price,
-                'highP': latest.get('high', 0),  # avg_high,
+                'highP': display_high_price,
                 'buy_price': buy_price,  # Actual buy price used in profit calculation
                 'sell_price': forecast_price,  # Actual sell price (forecast)
                 'lowVol': low_vol,
@@ -881,24 +978,18 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
     status_filter = filters.get('STATUS_FILTER') if isinstance(filters, dict) else None
     status_filter_mode = filters.get('STATUS_FILTER_MODE', 'include') if isinstance(filters, dict) else 'include'
     
-    print(f"[DEBUG-BACKEND] status_filter from filters: {status_filter}")
-    print(f"[DEBUG-BACKEND] status_filter_mode: {status_filter_mode}")
-    print(f"[DEBUG-BACKEND] Results before filter: {len(results_for_table)} items")
     
     if status_filter and isinstance(status_filter, list) and len(status_filter) > 0:
         # Normalize filter terms (strip whitespace)
         normalized_filter = [sf.strip() for sf in status_filter if sf and isinstance(sf, str)]
         
-        print(f"[DEBUG-BACKEND] Filter terms: {normalized_filter}")
         
         # Debug: Show sample of actual status values
         sample_statuses = [r.get('status', '') for r in results_for_table[:10]]
-        print(f"[DEBUG-BACKEND] Sample status values (first 10): {sample_statuses}")
         
         if status_filter_mode == 'exclude':
             results_before = len(results_for_table)
             results_for_table = [r for r in results_for_table if not any(sf in r.get('status', '') for sf in normalized_filter)]
-            print(f"[DEBUG-BACKEND] Exclude mode: {results_before} -> {len(results_for_table)} items")
         else:
             # Include mode: handle "Normal" with exact match, others with substring match
             results_before = len(results_for_table)
@@ -921,12 +1012,10 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
                 if matched:
                     filtered.append(r)
             results_for_table = filtered
-            print(f"[DEBUG-BACKEND] Include mode: {results_before} -> {len(results_for_table)} items")
             
         # Keep forecasts aligned with filtered rows
         allowed_ids = {str(r['id']) for r in results_for_table if 'id' in r}
         forecast_results = [fr for fr in forecast_results if str(fr.get('id')) in allowed_ids]
-        print(f"[DEBUG-BACKEND] Forecasts aligned: {len(forecast_results)} items")
     
     # Second pass: exclude items matching exclusion terms
     status_exclude = filters.get('STATUS_EXCLUDE') if isinstance(filters, dict) else None
@@ -935,7 +1024,6 @@ def analyze_forecast_gui(filters, forecast_sell_time, forecast_strategy='wma', n
         if exclude_terms:
             results_before = len(results_for_table)
             results_for_table = [r for r in results_for_table if not any(term in r.get('status', '') for term in exclude_terms)]
-            print(f"[DEBUG-BACKEND] After exclude pass: {results_before} -> {len(results_for_table)} items")
             # Keep forecasts aligned
             allowed_ids = {str(r['id']) for r in results_for_table if 'id' in r}
             forecast_results = [fr for fr in forecast_results if str(fr.get('id')) in allowed_ids]

@@ -222,16 +222,29 @@ body {
     min-width: 14ch;
 }
 
+/* Keep Forecast Strategy readable: prevent narrow wrapped/overlapped option text. */
+#app-container .tab-page #forecast-strategy .Select-control {
+    min-width: 24ch;
+}
+
+#app-container .tab-page #forecast-strategy .Select-menu-outer,
+#app-container .tab-page #forecast-strategy .Select-menu {
+    min-width: 32ch;
+}
+
+#app-container .tab-page #forecast-strategy .Select-option,
+#app-container .tab-page #forecast-strategy .VirtualizedSelectOption {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 #app-container .tab-page #template-dropdown .Select-control {
     min-width: 18ch;
     max-width: 36ch;
 }
 
-/* Extra left inset so value text clears the clear (×) button. */
-#app-container .tab-page #template-dropdown .Select--single > .Select-control .Select-value,
-#app-container .tab-page #template-dropdown .Select--single > .Select-control .Select-placeholder {
-    left: 26px !important;
-}
+/* No longer needed — flex: 1 on .Select-multi-value-wrapper keeps × on the right. */
 
 #app-container .tab-page .filter-field input[type="text"] {
     width: auto !important;
@@ -308,6 +321,23 @@ body {
 #app-container .tab-page .Select-control {
     display: flex;
     align-items: center;
+    height: var(--gw-control-height) !important;
+    min-height: var(--gw-control-height) !important;
+    box-sizing: border-box;
+}
+
+/* Makes the value/input span fill all available space so the clear × is pushed
+   to the right end rather than sitting immediately after a collapsed wrapper.
+   align-self: stretch + height: 100% are critical for single-select: .Select-value is
+   absolutely positioned (top:0;bottom:0) relative to this wrapper, so the wrapper MUST
+   span the full control height or the value text floats above the border. */
+#app-container .tab-page .Select-multi-value-wrapper {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    position: relative;
+    align-self: stretch;
+    height: 100%;
 }
 
 #app-container .tab-page .Select-placeholder,
@@ -320,13 +350,29 @@ body {
 #app-container .tab-page .Select--single > .Select-control .Select-value,
 #app-container .tab-page .Select--single > .Select-control .Select-placeholder {
     left: 10px !important;
-    right: 10px !important;
+    right: 30px !important;   /* 30px leaves room for the clear × button on the right */
     top: 0 !important;
     bottom: 0 !important;
     padding: 0 !important;
     box-sizing: border-box;
     display: flex !important;
     align-items: center !important;
+}
+
+#app-container .tab-page .Select--single > .Select-control .Select-value-label,
+#app-container .tab-page .Select--single > .Select-control .Select-placeholder {
+    display: flex !important;
+    align-items: center !important;
+    height: 100% !important;
+}
+
+/* Keep dropdown menu options legible and consistently spaced. */
+#app-container .tab-page .Select-option,
+#app-container .tab-page .VirtualizedSelectOption {
+    min-height: 30px;
+    line-height: 1.2;
+    padding-top: 5px;
+    padding-bottom: 5px;
 }
 
 #app-container .tab-page .Select-value,
@@ -370,8 +416,143 @@ body {
 /* Dense rows that previously had awkward wrapping/gaps. */
 #app-container .tab-page .compact-threshold-row,
 #app-container .tab-page .compact-ranking-row {
-    column-gap: var(--gw-field-gap-x) !important;
+    column-gap: 0 !important;
     row-gap: var(--gw-field-gap-y) !important;
+}
+
+/* Section 4 has direct controls in one row; force consistent vertical rhythm.
+   Zero out all inline margin-right values (labels: 10px, controls: 30px) so spacing
+   is driven purely by the explicit left-margin on each label instead. */
+#app-container .tab-page .compact-ranking-row > * {
+    align-self: center !important;
+    margin-right: 0 !important;
+}
+
+/* Each label opens a new group: tight spacing before its own control. */
+#app-container .tab-page .compact-ranking-row > label {
+    margin-left: 12px !important;
+    margin-right: 6px !important;
+}
+
+/* First label needs no leading gap. */
+#app-container .tab-page .compact-ranking-row > label:first-child {
+    margin-left: 0 !important;
+}
+
+#app-container .tab-page .compact-ranking-row .dash-dropdown,
+#app-container .tab-page .compact-ranking-row .Select-control,
+#app-container .tab-page .compact-ranking-row input[type="number"] {
+    height: var(--gw-control-height) !important;
+    min-height: var(--gw-control-height) !important;
+}
+
+/* Number inputs in section 4 should be just wide enough for their value.
+   field-sizing: content doesn't help when width: auto falls back to browser default,
+   so set an explicit compact width here. */
+#app-container .tab-page .compact-ranking-row input[type="number"] {
+    width: 52px !important;
+    min-width: unset !important;
+    max-width: unset !important;
+}
+
+/* Risk dropdown: wider menu and unwrapped options so labels don't look mixed/scrambled. */
+#app-container .tab-page #risk-filter .Select-control {
+    min-width: 12ch;
+}
+
+#app-container .tab-page #risk-filter .Select-menu-outer,
+#app-container .tab-page #risk-filter .Select-menu {
+    min-width: 16ch;
+}
+
+#app-container .tab-page #risk-filter .Select-option,
+#app-container .tab-page #risk-filter .VirtualizedSelectOption {
+    white-space: normal;
+}
+
+/* Status/Warnings multi-select: each part needs its own rules. */
+
+/* Placeholder centering when nothing is selected. */
+#app-container .tab-page #status-filter .Select-placeholder {
+    display: flex !important;
+    align-items: center !important;
+    height: 100% !important;
+}
+
+/* Wrapper becomes a wrapping flex row so chips sit inline.
+   height: auto overrides the base 100% — multi-select wrapper must grow with chips. */
+#app-container .tab-page #status-filter .Select-multi-value-wrapper {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    gap: 2px;
+    padding: 2px 4px !important;
+    height: auto !important;
+    min-height: calc(var(--gw-control-height) - 2px) !important;
+    overflow: hidden !important;
+}
+
+/* Each selected-value chip: compact tag, not stretched to fill the flex row. */
+#app-container .tab-page #status-filter .Select-value {
+    display: inline-flex !important;
+    align-items: center !important;
+    flex: 0 0 auto !important;
+    height: 24px !important;
+    line-height: 1 !important;
+    margin: 1px 0 !important;
+    max-width: 200px;
+}
+
+/* Reset the global 34px line-height that inflates chip labels. */
+#app-container .tab-page #status-filter .Select--multi .Select-value-label {
+    display: inline !important;
+    height: auto !important;
+    min-height: unset !important;
+    line-height: 1 !important;
+    padding: 0 4px !important;
+}
+
+#app-container .tab-page #status-filter .Select-value-icon {
+    display: inline-flex !important;
+    align-items: center !important;
+    height: 100% !important;
+    padding: 0 4px !important;
+}
+
+/* Saved filter selected text alignment fix. */
+#app-container .tab-page #template-dropdown .Select-value-label,
+#app-container .tab-page #template-dropdown .Select-placeholder {
+    display: flex !important;
+    align-items: center !important;
+    height: 100% !important;
+}
+
+/* DataTable pagination controls alignment. */
+#app-container #forecast-table .previous-next-container,
+#app-container #watchlist-table .previous-next-container {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+#app-container #forecast-table .previous-next-container button,
+#app-container #watchlist-table .previous-next-container button,
+#app-container #forecast-table .page-number,
+#app-container #watchlist-table .page-number,
+#app-container #forecast-table .current-page-container input,
+#app-container #watchlist-table .current-page-container input {
+    height: 34px !important;
+    min-height: 34px !important;
+    line-height: 32px !important;
+    box-sizing: border-box;
+}
+
+#app-container #forecast-table .current-page-container,
+#app-container #watchlist-table .current-page-container {
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px;
 }
 
 /* Checklist alignment: keep checkbox and text on one straight line. */
@@ -463,30 +644,31 @@ body {
 #app-container #watchlist-table .dash-cell,
 #app-container #watchlist-table .dash-header {
     min-height: 0 !important;
-    height: 20px !important;
-    max-height: 20px !important;
+    height: 30px !important;
+    max-height: 30px !important;
     padding-top: 0 !important;
     padding-bottom: 0 !important;
     padding-left: 6px !important;
     padding-right: 6px !important;
-    line-height: 20px !important;
+    line-height: 30px !important;
     overflow: hidden !important;
     white-space: nowrap !important;
+    font-size: 12px !important;
 }
-
+/* 
 /* Reset: .tab-page input rule sets min-height via --gw-control-height on editable cell inputs. */
 #app-container #forecast-table .dash-spreadsheet input,
 #app-container #watchlist-table .dash-spreadsheet input {
-    height: 20px !important;
+    height: 24px !important;
     min-height: 0 !important;
-    max-height: 20px !important;
-    line-height: 20px !important;
+    max-height: 24px !important;
+    line-height: 24px !important;
     padding-top: 0 !important;
     padding-bottom: 0 !important;
     border: none !important;
     box-shadow: none !important;
     border-radius: 0 !important;
-    font-size: 11px !important;
+    font-size: 12px !important;
 }
 
 #app-container #forecast-table .dash-spreadsheet tr,
@@ -501,14 +683,14 @@ body {
 #app-container #watchlist-table .dash-spreadsheet td,
 #app-container #watchlist-table .dash-spreadsheet th,
 #app-container #watchlist-table .dash-cell-value {
-    font-size: 11px !important;
+    font-size: 12px !important;
     padding: 0px 6px !important;
-    line-height: 20px !important;
-    height: 20px !important;
-    max-height: 20px !important;
+    line-height: 30px !important;
+    height: 30px !important;
+    max-height: 30px !important;
     white-space: nowrap !important;
     overflow: hidden !important;
-}
+} */
 
 #app-container .dash-spreadsheet tbody tr:hover td {
     filter: brightness(0.97);
